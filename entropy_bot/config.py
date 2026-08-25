@@ -8,7 +8,15 @@ from dotenv import load_dotenv
 
 from entropy_bot.coins import ALLOWED_COINS, validate_coin_list
 from entropy_bot.errors import ConfigError, LiveGuardError
-from entropy_bot.fees import DEFAULT_FEE_TIER, rates_for_tier
+from entropy_bot.fees import (
+    DEFAULT_ENTROPY_REFERRAL_REWARD,
+    DEFAULT_ENTROPY_REFERRED_USER_BENEFIT,
+    DEFAULT_ENTROPY_SELF_REBATE,
+    DEFAULT_ENTROPY_TIER,
+    DEFAULT_FEE_TIER,
+    entropy_program,
+    rates_for_tier,
+)
 
 DEFAULT_API_URL = "https://api.hyperliquid.xyz"
 DEFAULT_WS_URL = "wss://api.hyperliquid.xyz/ws"
@@ -33,6 +41,10 @@ class Settings:
     fee_tier: int = DEFAULT_FEE_TIER
     referral_discount: float = 0.0
     maker_rebate_bps: float | None = None
+    entropy_tier: int = DEFAULT_ENTROPY_TIER
+    entropy_self_rebate: float = DEFAULT_ENTROPY_SELF_REBATE
+    entropy_referral_reward: float = DEFAULT_ENTROPY_REFERRAL_REWARD
+    entropy_referred_user_benefit: float = DEFAULT_ENTROPY_REFERRED_USER_BENEFIT
 
     @property
     def paper(self) -> bool:
@@ -62,13 +74,29 @@ def load_settings(dotenv_path: str | Path | None = None) -> Settings:
         referral = float(os.environ.get("REFERRAL_DISCOUNT", "0") or 0)
         rebate_raw = _optional_env("MAKER_REBATE_BPS")
         rebate_bps = float(rebate_raw) if rebate_raw is not None else None
+        entropy_tier = int(os.environ.get("ENTROPY_TIER", DEFAULT_ENTROPY_TIER))
+        self_rebate_raw = _optional_env("ENTROPY_SELF_REBATE")
+        entropy_self_rebate = (
+            float(self_rebate_raw) if self_rebate_raw is not None else DEFAULT_ENTROPY_SELF_REBATE
+        )
+        reward_raw = _optional_env("ENTROPY_REFERRAL_REWARD")
+        entropy_referral_reward = (
+            float(reward_raw) if reward_raw is not None else DEFAULT_ENTROPY_REFERRAL_REWARD
+        )
+        referred_raw = _optional_env("ENTROPY_REFERRED_USER_BENEFIT")
+        entropy_referred = (
+            float(referred_raw) if referred_raw is not None else DEFAULT_ENTROPY_REFERRED_USER_BENEFIT
+        )
     except ValueError as exc:
         raise ConfigError(f"invalid numeric config: {exc}") from exc
     if notional <= 0 or offset < 0 or max_lev < 1:
         raise ConfigError("QUOTE_NOTIONAL_USD, QUOTE_OFFSET_TICKS, MAX_LEVERAGE must be positive")
     rates_for_tier(fee_tier)
+    entropy_program(entropy_tier)
     if not 0.0 <= referral < 1.0:
         raise ConfigError("REFERRAL_DISCOUNT must be in [0, 1)")
+    if entropy_self_rebate < 0 or entropy_referral_reward < 0 or entropy_referred < 0:
+        raise ConfigError("Entropy rebate rates must be >= 0")
     api_url = _optional_env("HYPERLIQUID_API_URL") or DEFAULT_API_URL
     ws_url = _optional_env("HYPERLIQUID_WS_URL") or DEFAULT_WS_URL
     if "hyperliquid.xyz" not in api_url or "hyperliquid.xyz" not in ws_url:
@@ -86,6 +114,10 @@ def load_settings(dotenv_path: str | Path | None = None) -> Settings:
         fee_tier=fee_tier,
         referral_discount=referral,
         maker_rebate_bps=rebate_bps,
+        entropy_tier=entropy_tier,
+        entropy_self_rebate=entropy_self_rebate,
+        entropy_referral_reward=entropy_referral_reward,
+        entropy_referred_user_benefit=entropy_referred,
     )
 
 

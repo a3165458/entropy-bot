@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Entropy Desk · ANTH / SNDK
 // @namespace    entropy-desk
-// @version      1.5.4
-// @description  Watch and ALO-quote io:ANTH and io:SNDK on EntropyIO
+// @version      1.5.5
+// @description  ALO-quote io:ANTH / io:SNDK; flatten reduce-only while in position
 // @match        https://entropy.io/*
 // @match        https://app.hyperliquid.xyz/*
 // @run-at       document-idle
@@ -65,7 +65,10 @@
     wsLastMsg: 0,
     wsOrderUser: "",
     lastDeadMan: 0,
-    lastReconcile: 0
+    lastReconcile: 0,
+    pos: { "io:ANTH": 0, "io:SNDK": 0 },
+    posTs: 0,
+    posForce: false
   };
   function anyAutoCoin() {
     for (var i = 0; i < ALLOWED.length; i++) {
@@ -1129,8 +1132,116 @@
     for (var i = 0; i < extras.length; i++) if (String(extras[i]) === String(oid)) return;
     extras.push(oid);
   }
-  function quoteKey(px) {
-    return String(px.buy) + "|" + String(px.sell);
+  function quoteKey(px, plan) {
+    var k = String(px.buy) + "|" + String(px.sell);
+    if (!plan) return k;
+    return k + "|" + String(plan.buySz || "") + "|" + String(plan.sellSz || "") + "|" + (plan.wantBuy ? "B" : "") + (plan.wantSell ? "S" : "") + "|" + (plan.buyR ? "1" : "0") + (plan.sellR ? "1" : "0");
+  }
+  function posSzi(coin) {
+    var v = Number(state.pos && state.pos[coin]);
+    return Number.isFinite(v) ? v : 0;
+  }
+  function fmtSzi(n) {
+    var x = Number(n);
+    if (!Number.isFinite(x)) return "0";
+    var t = x.toFixed(8);
+    if (t.indexOf(".") !== -1) t = t.replace(/\.?0+$/, "");
+    return t || "0";
+  }
+  function normalizePosCoin(c) {
+    c = String(c || "");
+    if (ALLOWED.indexOf(c) !== -1) return c;
+    if (c.indexOf(":") === -1) {
+      var pref = DEX + ":" + c;
+      if (ALLOWED.indexOf(pref) !== -1) return pref;
+    }
+    return normalizeWsCoin(c);
+  }
+  function parseClearinghouse(json, into, mentioned) {
+    var rows = json && json.assetPositions;
+    if (!Array.isArray(rows)) return false;
+    var i;
+    for (i = 0; i < rows.length; i++) {
+      var pos = rows[i] && rows[i].position;
+      if (!pos) continue;
+      var coin = normalizePosCoin(pos.coin);
+      if (!coin) continue;
+      var szi = Number(pos.szi);
+      if (!Number.isFinite(szi)) szi = 0;
+      into[coin] = szi;
+      if (mentioned) mentioned[coin] = true;
+    }
+    return true;
+  }
+  async function refreshPositions(force) {
+    var t = nowMs();
+    if (!force && state.posTs && (t - state.posTs) < 800) return state.pos;
+    var user = "";
+    try { user = masterUser(); } catch (eU) { user = currentWallet() || ""; }
+    if (!user) return state.pos;
+    var next = {};
+    var mentioned = {};
+    var i;
+    for (i = 0; i < ALLOWED.length; i++) next[ALLOWED[i]] = 0;
+    var mainOk = false, ioOk = false;
+    try {
+      var a = await hlInfo({ type: "clearinghouseState", user: user });
+      if (a && parseClearinghouse(a, next, mentioned)) mainOk = true;
+    } catch (eA) { warn("clearinghouseState", eA && eA.message); }
+    try {
+      var b = await hlInfo({ type: "clearinghouseState", user: user, dex: DEX });
+      if (b && parseClearinghouse(b, next, mentioned)) ioOk = true;
+    } catch (eB) { warn("clearinghouseState io", eB && eB.message); }
+    if (mainOk || ioOk) {
+      if (!ioOk) {
+        for (i = 0; i < ALLOWED.length; i++) {
+          if (!mentioned[ALLOWED[i]]) next[ALLOWED[i]] = posSzi(ALLOWED[i]);
+        }
+      }
+      state.pos = next;
+      state.posTs = nowMs();
+    } else if (!force) {
+      state.posTs = nowMs();
+    }
+    return state.pos;
+  }
+  function reduceSz(absSzi, px, szDecimals, notional) {
+    var ntlWired = sizeFromNotional(px, szDecimals, notional);
+    var ntlN = Number(ntlWired);
+    var abs = Number(absSzi);
+    if (!(abs > 0)) throw new Error("数量过小");
+    var use = abs < ntlN ? abs : ntlN;
+    var wired = roundSz(use, szDecimals);
+    if (Number(wired) > abs + 1e-12) {
+      var fac = Math.pow(10, szDecimals | 0);
+      var floored = Math.floor(abs * fac + 1e-12) / fac;
+      if (!(floored > 0)) throw new Error("数量过小");
+      wired = floatToWire(floored);
+    }
+    return wired;
+  }
+  function flattenPlan(coin, q, px) {
+    var szi = posSzi(coin);
+    var buySz = sizeFromNotional(px.buy, q.szDecimals, state.notional);
+    var sellSz = sizeFromNotional(px.sell, q.szDecimals, state.notional);
+    if (szi > 0) {
+      try { sellSz = reduceSz(Math.abs(szi), px.sell, q.szDecimals, state.notional); }
+      catch (eL) { sellSz = roundSz(Math.abs(szi), q.szDecimals); }
+      return { mode: "long", szi: szi, wantBuy: false, wantSell: true, buySz: buySz, sellSz: sellSz, buyR: false, sellR: true };
+    }
+    if (szi < 0) {
+      try { buySz = reduceSz(Math.abs(szi), px.buy, q.szDecimals, state.notional); }
+      catch (eS) { buySz = roundSz(Math.abs(szi), q.szDecimals); }
+      return { mode: "short", szi: szi, wantBuy: true, wantSell: false, buySz: buySz, sellSz: sellSz, buyR: true, sellR: false };
+    }
+    return { mode: "flat", szi: 0, wantBuy: true, wantSell: true, buySz: buySz, sellSz: sellSz, buyR: false, sellR: false };
+  }
+  function flattenStatusBit(coin) {
+    var name = String(coin).replace(/^io:/, "");
+    var szi = posSzi(coin);
+    if (szi > 0) return name + " 多 " + fmtSzi(szi) + " → 只挂卖平 @ask";
+    if (szi < 0) return name + " 空 " + fmtSzi(Math.abs(szi)) + " → 只挂买平 @bid";
+    return name + " 空仓 双边";
   }
   function statusOid(st) {
     if (!st || typeof st === "string") return null;
@@ -1222,6 +1333,7 @@
       if (autoOn(coin) && /filled/.test(status)) {
         state.lastQuoted[coin] = "";
         state.needsRequote[coin] = true;
+        state.posForce = true;
         requoteCoin(coin).catch(function (eF) { warn("成交补挂", eF && eF.message); });
       }
       return;
@@ -1278,7 +1390,7 @@
     if (!autoOn(coin)) return;
     try {
       var px = aloPrices(q);
-      var key = quoteKey(px);
+      var key = quoteKey(px, flattenPlan(coin, q, px));
       if (key !== state.lastQuoted[coin]) requoteCoin(coin).catch(function (eR) { warn("ws requote", eR && eR.message); });
     } catch (ePx) {}
   }
@@ -1345,17 +1457,18 @@
       state.lastDeadMan = t - 4000;
     }
   }
-  async function placeSides(coin, q, px, wantBuy, wantSell) {
+  async function placeSides(coin, q, px, wantBuy, wantSell, plan) {
+    plan = plan || flattenPlan(coin, q, px);
     var orders = [];
-    var buySz = sizeFromNotional(px.buy, q.szDecimals, state.notional);
-    var sellSz = sizeFromNotional(px.sell, q.szDecimals, state.notional);
-    if (wantBuy) orders.push({ a: q.assetId, b: true, p: px.buy, s: buySz, r: false });
-    if (wantSell) orders.push({ a: q.assetId, b: false, p: px.sell, s: sellSz, r: false });
+    var buySz = plan.buySz;
+    var sellSz = plan.sellSz;
+    if (wantBuy && plan.wantBuy) orders.push({ a: q.assetId, b: true, p: px.buy, s: buySz, r: !!plan.buyR });
+    if (wantSell && plan.wantSell) orders.push({ a: q.assetId, b: false, p: px.sell, s: sellSz, r: !!plan.sellR });
     if (!orders.length) return null;
     var resp = await sendSignedAction(buildOrderAction(orders));
     if (!actionOk(resp)) throw new Error("下单失败 " + JSON.stringify(resp));
     ingestOrderStatuses(coin, orders, resp);
-    log("挂单 " + coin + (wantBuy ? " 买 " + buySz + " @ " + px.buy : "") + (wantSell ? " 卖 " + sellSz + " @ " + px.sell : ""));
+    log("挂单 " + coin + (wantBuy && plan.wantBuy ? " 买 " + buySz + " @ " + px.buy + (plan.buyR ? " ro" : "") : "") + (wantSell && plan.wantSell ? " 卖 " + sellSz + " @ " + px.sell + (plan.sellR ? " ro" : "") : ""));
     return resp;
   }
   async function requoteCoin(coin) {
@@ -1371,8 +1484,12 @@
       var q = state.quotes[coin];
       if (!q || q.assetId == null || !Number.isFinite(q.mid)) q = await ensureQuote(coin);
       if (!q || q.assetId == null) throw new Error("资产未解析: " + coin);
+      var forcePos = !!state.posForce;
+      state.posForce = false;
+      await refreshPositions(forcePos);
       var px = aloPrices(q);
-      var key = quoteKey(px);
+      var plan = flattenPlan(coin, q, px);
+      var key = quoteKey(px, plan);
       var slot = oidSlot(coin);
       var extras = state.extraOids[coin] || [];
       if (extras.length) {
@@ -1380,71 +1497,58 @@
         state.extraOids[coin] = [];
         if (!autoOn(coin)) return;
       }
-      var buySz = sizeFromNotional(px.buy, q.szDecimals, state.notional);
-      var sellSz = sizeFromNotional(px.sell, q.szDecimals, state.notional);
+      var kill = [];
+      if (!plan.wantBuy && slot.buy != null) kill.push(slot.buy);
+      if (!plan.wantSell && slot.sell != null) kill.push(slot.sell);
+      if (kill.length) {
+        await cancelOids(coin, kill);
+        if (!plan.wantBuy) slot.buy = null;
+        if (!plan.wantSell) slot.sell = null;
+        if (!autoOn(coin)) return;
+      }
       var haveBuy = slot.buy != null;
       var haveSell = slot.sell != null;
-      if (haveBuy && haveSell && key === state.lastQuoted[coin]) {
+      var wantBuy = !!plan.wantBuy;
+      var wantSell = !!plan.wantSell;
+      if (haveBuy === wantBuy && haveSell === wantSell && key === state.lastQuoted[coin]) {
         await maybeDeadMan();
         return;
       }
-      if (haveBuy && haveSell) {
-        var mods = [];
-        var prev = String(state.lastQuoted[coin] || "").split("|");
-        if (!pxEqual(prev[0], px.buy)) mods.push(modifyWire(slot.buy, { a: q.assetId, b: true, p: px.buy, s: buySz, r: false }));
-        if (!pxEqual(prev[1], px.sell)) mods.push(modifyWire(slot.sell, { a: q.assetId, b: false, p: px.sell, s: sellSz, r: false }));
-        if (!mods.length) {
-          state.lastQuoted[coin] = key;
-          await maybeDeadMan();
-          return;
-        }
+      var buySz = plan.buySz;
+      var sellSz = plan.sellSz;
+      var mods = [];
+      var prev = String(state.lastQuoted[coin] || "").split("|");
+      if (wantBuy && haveBuy && (!pxEqual(prev[0], px.buy) || String(prev[2] || "") !== String(buySz))) {
+        mods.push(modifyWire(slot.buy, { a: q.assetId, b: true, p: px.buy, s: buySz, r: !!plan.buyR }));
+      }
+      if (wantSell && haveSell && (!pxEqual(prev[1], px.sell) || String(prev[3] || "") !== String(sellSz))) {
+        mods.push(modifyWire(slot.sell, { a: q.assetId, b: false, p: px.sell, s: sellSz, r: !!plan.sellR }));
+      }
+      if (mods.length) {
         if (!autoOn(coin)) return;
         var resp = await sendSignedAction(buildModifyAction(mods));
         var sts = respStatuses(resp);
-        var goneSides = [];
         var i;
         for (i = 0; i < mods.length; i++) {
           var err = statusError(sts[i]);
           if (err || !actionOk(resp)) {
-            if (mods[i].order.b) { slot.buy = null; goneSides.push("buy"); }
-            else { slot.sell = null; goneSides.push("sell"); }
+            if (mods[i].order.b) slot.buy = null;
+            else slot.sell = null;
           } else {
             var oid = statusOid(sts[i]);
             if (oid != null) ingestSideOid(coin, mods[i].order.b, oid);
           }
         }
-        if (goneSides.length) {
-          if (!autoOn(coin)) return;
-          await placeSides(coin, q, px, goneSides.indexOf("buy") !== -1, goneSides.indexOf("sell") !== -1);
-        }
-        state.lastQuoted[coin] = key;
-        log("改价 " + coin + " 买 @ " + px.buy + " / 卖 @ " + px.sell);
-      } else {
-        var mods2 = [];
-        if (haveBuy && !pxEqual((state.lastQuoted[coin] || "").split("|")[0], px.buy)) {
-          mods2.push(modifyWire(slot.buy, { a: q.assetId, b: true, p: px.buy, s: buySz, r: false }));
-        }
-        if (haveSell && !pxEqual((state.lastQuoted[coin] || "").split("|")[1], px.sell)) {
-          mods2.push(modifyWire(slot.sell, { a: q.assetId, b: false, p: px.sell, s: sellSz, r: false }));
-        }
-        if (mods2.length) {
-          if (!autoOn(coin)) return;
-          var resp2 = await sendSignedAction(buildModifyAction(mods2));
-          var sts2 = respStatuses(resp2);
-          for (var j = 0; j < mods2.length; j++) {
-            var err2 = statusError(sts2[j]);
-            if (err2 || !actionOk(resp2)) {
-              if (mods2[j].order.b) slot.buy = null;
-              else slot.sell = null;
-            }
-          }
-        }
-        if (!autoOn(coin)) return;
-        if (slot.buy == null || slot.sell == null) {
-          await placeSides(coin, q, px, slot.buy == null, slot.sell == null);
-        }
-        state.lastQuoted[coin] = key;
       }
+      if (!autoOn(coin)) return;
+      var needBuy = wantBuy && slot.buy == null;
+      var needSell = wantSell && slot.sell == null;
+      if (needBuy || needSell) {
+        await placeSides(coin, q, px, needBuy, needSell, plan);
+      }
+      state.lastQuoted[coin] = key;
+      log("改价 " + coin + " " + flattenStatusBit(coin) + " 买@" + px.buy + " 卖@" + px.sell);
+      setStatus("自动紧贴 " + flattenStatusBit(coin), false);
       await maybeDeadMan();
     } catch (eReq) {
       warn("requote", coin, eReq && eReq.message);
@@ -1688,7 +1792,7 @@
       state.lastQuoted[coin] = "";
       state.needsRequote[coin] = true;
       syncAutoMm();
-      setStatus(coin + " 自动紧贴已开启·盘口变动即改价", false);
+      setStatus(coin + " 自动紧贴已开启·空仓双边 / 有仓只平", false);
       updateAutoBits();
       connectWs();
       return requoteCoin(coin);
@@ -1733,7 +1837,7 @@
         state.needsRequote[missing[k]] = true;
       }
       syncAutoMm();
-      setStatus("自动紧贴已开启·盘口变动即改价", false);
+      setStatus("自动紧贴已开启·空仓双边 / 有仓只平", false);
       updateAutoBits();
       connectWs();
       return autoMmTick();
@@ -1778,7 +1882,9 @@
         var need = state.lastQuoted[coin] === "" || state.needsRequote[coin];
         if (!need && state.quotes[coin]) {
           try {
-            if (quoteKey(aloPrices(state.quotes[coin])) !== state.lastQuoted[coin]) need = true;
+            var qn = state.quotes[coin];
+            var pn = aloPrices(qn);
+            if (quoteKey(pn, flattenPlan(coin, qn, pn)) !== state.lastQuoted[coin]) need = true;
           } catch (ePx0) { need = !wsFresh; }
         }
         if (need) await requoteCoin(coin);
@@ -1809,14 +1915,9 @@
         var bits = [];
         for (var b = 0; b < ALLOWED.length; b++) {
           if (!autoOn(ALLOWED[b])) continue;
-          var qq = state.quotes[ALLOWED[b]];
-          if (!qq) continue;
-          try {
-            var pp = aloPrices(qq);
-            bits.push(ALLOWED[b].replace("io:", "") + " 买@" + pp.buy + " 卖@" + pp.sell);
-          } catch (eB) {}
+          bits.push(flattenStatusBit(ALLOWED[b]));
         }
-        if (bits.length) setStatus("自动紧贴中 " + bits.join(" · "), false);
+        if (bits.length) setStatus("自动紧贴 " + bits.join(" · "), false);
         await maybeDeadMan();
       }
     } catch (eAuto) {
@@ -1836,9 +1937,11 @@
       if (!q || q.assetId == null) throw new Error("资产未解析: " + coin);
       var wallet = currentWallet();
       if (!wallet) throw new Error("没有钱包地址");
+      await refreshPositions(true);
       var px = aloPrices(q);
-      var buySz = sizeFromNotional(px.buy, q.szDecimals, state.notional);
-      var sellSz = sizeFromNotional(px.sell, q.szDecimals, state.notional);
+      var plan = flattenPlan(coin, q, px);
+      var buySz = plan.buySz;
+      var sellSz = plan.sellSz;
       var slot = oidSlot(coin);
       var extras = state.extraOids[coin] || [];
       if (extras.length) {
@@ -1847,23 +1950,48 @@
       }
       var resp;
       if (slot.buy != null && slot.sell != null) {
-        var mods = [
-          modifyWire(slot.buy, { a: q.assetId, b: true, p: px.buy, s: buySz, r: false }),
-          modifyWire(slot.sell, { a: q.assetId, b: false, p: px.sell, s: sellSz, r: false })
-        ];
-        setStatus("正在改价实盘双边 " + coin + " 买 " + buySz + " @ " + px.buy + " / 卖 " + sellSz + " @ " + px.sell, false);
-        resp = await sendSignedAction(buildModifyAction(mods));
-        var sts = respStatuses(resp);
-        var needBuy = false, needSell = false;
-        if (!actionOk(resp) || statusError(sts[0])) { slot.buy = null; needBuy = true; }
-        if (!actionOk(resp) || statusError(sts[1])) { slot.sell = null; needSell = true; }
-        if (needBuy || needSell) resp = await placeSides(coin, q, px, needBuy, needSell);
+        var killLb = [];
+        if (!plan.wantBuy && slot.buy != null) killLb.push(slot.buy);
+        if (!plan.wantSell && slot.sell != null) killLb.push(slot.sell);
+        if (killLb.length) {
+          await cancelOids(coin, killLb);
+          if (!plan.wantBuy) slot.buy = null;
+          if (!plan.wantSell) slot.sell = null;
+        }
+        var mods = [];
+        if (plan.wantBuy && slot.buy != null) mods.push(modifyWire(slot.buy, { a: q.assetId, b: true, p: px.buy, s: buySz, r: !!plan.buyR }));
+        if (plan.wantSell && slot.sell != null) mods.push(modifyWire(slot.sell, { a: q.assetId, b: false, p: px.sell, s: sellSz, r: !!plan.sellR }));
+        setStatus("正在改价 " + flattenStatusBit(coin), false);
+        if (mods.length) {
+          resp = await sendSignedAction(buildModifyAction(mods));
+          var sts = respStatuses(resp);
+          var mi0;
+          for (mi0 = 0; mi0 < mods.length; mi0++) {
+            if (!actionOk(resp) || statusError(sts[mi0])) {
+              if (mods[mi0].order.b) slot.buy = null;
+              else slot.sell = null;
+            }
+          }
+        }
+        var needBuy = plan.wantBuy && slot.buy == null;
+        var needSell = plan.wantSell && slot.sell == null;
+        if (needBuy || needSell) resp = await placeSides(coin, q, px, needBuy, needSell, plan);
       } else {
         var hadBuy = slot.buy != null;
         var hadSell = slot.sell != null;
         var mods2 = [];
-        if (hadBuy) mods2.push(modifyWire(slot.buy, { a: q.assetId, b: true, p: px.buy, s: buySz, r: false }));
-        if (hadSell) mods2.push(modifyWire(slot.sell, { a: q.assetId, b: false, p: px.sell, s: sellSz, r: false }));
+        var killLb2 = [];
+        if (!plan.wantBuy && slot.buy != null) killLb2.push(slot.buy);
+        if (!plan.wantSell && slot.sell != null) killLb2.push(slot.sell);
+        if (killLb2.length) {
+          await cancelOids(coin, killLb2);
+          if (!plan.wantBuy) slot.buy = null;
+          if (!plan.wantSell) slot.sell = null;
+          hadBuy = slot.buy != null;
+          hadSell = slot.sell != null;
+        }
+        if (hadBuy && plan.wantBuy) mods2.push(modifyWire(slot.buy, { a: q.assetId, b: true, p: px.buy, s: buySz, r: !!plan.buyR }));
+        if (hadSell && plan.wantSell) mods2.push(modifyWire(slot.sell, { a: q.assetId, b: false, p: px.sell, s: sellSz, r: !!plan.sellR }));
         if (mods2.length) {
           resp = await sendSignedAction(buildModifyAction(mods2));
           var sts2 = respStatuses(resp);
@@ -1874,13 +2002,13 @@
             }
           }
         }
-        if (slot.buy == null || slot.sell == null) {
-          resp = await placeSides(coin, q, px, slot.buy == null, slot.sell == null);
+        if ((plan.wantBuy && slot.buy == null) || (plan.wantSell && slot.sell == null)) {
+          resp = await placeSides(coin, q, px, plan.wantBuy && slot.buy == null, plan.wantSell && slot.sell == null, plan);
         }
       }
-      state.lastQuoted[coin] = quoteKey(px);
-      log("实盘双边回报 " + JSON.stringify(resp));
-      setStatus("实盘双边 " + coin + " " + JSON.stringify(resp && resp.response ? resp.response : resp), false);
+      state.lastQuoted[coin] = quoteKey(px, plan);
+      log("实盘回报 " + JSON.stringify(resp));
+      setStatus("实盘 " + flattenStatusBit(coin) + " " + JSON.stringify(resp && resp.response ? resp.response : resp), false);
       return resp;
     } finally {
       state.inFlight = false;
@@ -2085,7 +2213,7 @@
     var ck = document.getElementById("ed-live");
     if (ck && ck.checked !== !!state.liveEnabled) ck.checked = !!state.liveEnabled;
     var mode = document.getElementById("ed-mode");
-    if (mode) mode.textContent = "自动紧贴：盘口变动即改价，撤单不排队确认";
+    if (mode) mode.textContent = "自动紧贴：空仓双边，有仓只挂平仓侧，撤单不排队确认";
     updateAutoBits();
   }
   function updateAutoBits() {
@@ -2105,7 +2233,7 @@
   function buildPanelOnce(box) {
     if (box.getAttribute("data-ed-built") === "1") return;
     box.setAttribute("data-ed-built", "1");
-    box.appendChild(el("div", { class: "ed-top" }, [el("div", { class: "ed-title", text: "Entropy Desk · ANTH / SNDK  1.5.4" }), el("span", { class: "ed-muted", id: "ed-wallet", text: shortAddr(currentWallet()) })]));
+    box.appendChild(el("div", { class: "ed-top" }, [el("div", { class: "ed-title", text: "Entropy Desk · ANTH / SNDK  1.5.5" }), el("span", { class: "ed-muted", id: "ed-wallet", text: shortAddr(currentWallet()) })]));
     box.appendChild(el("div", { class: "ed-fees", text: "净手续费  taker ≈ 0   maker 0\nHL档4 0.028% × HIP-3×2 × growth×0.1 − Entropy自返200%×50%份额" }));
     var inp = el("input", { type: "number", min: "10", step: "1", value: String(state.notional), id: "ed-notional" });
     inp.addEventListener("change", function () { var v = Number(inp.value); if (v > 0) state.notional = v; });
@@ -2123,8 +2251,8 @@
     autoLab.appendChild(autoCk);
     autoLab.appendChild(document.createTextNode(" 全部自动紧贴"));
     box.appendChild(el("div", { class: "ed-row" }, [autoLab]));
-    box.appendChild(el("div", { class: "ed-muted", id: "ed-automm-help", text: "每个币单独勾选自动紧贴" }));
-    box.appendChild(el("div", { class: "ed-muted", id: "ed-mode", text: "自动紧贴：盘口变动即改价，撤单不排队确认" }));
+    box.appendChild(el("div", { class: "ed-muted", id: "ed-automm-help", text: "空仓双边；有仓只挂 reduce-only 平仓侧" }));
+    box.appendChild(el("div", { class: "ed-muted", id: "ed-mode", text: "自动紧贴：空仓双边，有仓只挂平仓侧" }));
     ALLOWED.forEach(function (c) { box.appendChild(buildCoinCard(c)); });
     var extra = el("div", { class: "ed-row" });
     var bAppr = el("button", { type: "button", class: "ed-btn ed-paper", text: "批准 Builder(0)" });
@@ -2172,9 +2300,9 @@
       render();
     } finally { state.polling = false; }
   }
-  window.EntropyDesk = { version: "1.5.4", state: state, fee: FEE, refresh: tick, paperBoth: paperBoth, liveBoth: liveBoth, liveOrder: liveOrder, approveBuilder: approveBuilder, openTrade: openTrade, assertAllowedCoin: assertAllowedCoin, printFees: printFees, setAutoMm: setAutoMm, setAutoCoin: setAutoCoin, cancelCoinOrders: cancelCoinOrders, cancelAllDesk: cancelAllDesk, aloPrices: aloPrices };
+  window.EntropyDesk = { version: "1.5.5", state: state, fee: FEE, refresh: tick, paperBoth: paperBoth, liveBoth: liveBoth, liveOrder: liveOrder, approveBuilder: approveBuilder, openTrade: openTrade, assertAllowedCoin: assertAllowedCoin, printFees: printFees, setAutoMm: setAutoMm, setAutoCoin: setAutoCoin, cancelCoinOrders: cancelCoinOrders, cancelAllDesk: cancelAllDesk, aloPrices: aloPrices };
   printFees();
-  log("已加载 1.5.4。每个币单独勾选自动紧贴。盘口变动即改价，撤单不排队确认。dead-man 20s。");
+  log("已加载 1.5.5。空仓双边 ALO，有仓只挂 reduce-only 平仓侧。盘口变动即改价。dead-man 20s。");
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", function () { render(); tick(); });
   else { render(); tick(); }
   setInterval(tick, POLL_MS);

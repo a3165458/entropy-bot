@@ -27,7 +27,7 @@ No entropy.io scraping, no third-party order relays.
 
    `scaleIfHip3 = 2` (because scale ≥ 1 → `deployerFeeScale * 2`), then growth mode `× 0.1`.
 
-   At fee tier 0 that is about **taker 0.009% / maker 0.003%**. The live command prints this estimate before every signed order.
+   Default fee model is **volume tier 4** (14d weighted volume > $500M): official perp base **taker 0.028% / maker 0.000%**. After HIP-3 ×2 and growth ×0.1 that is **taker 0.0056% / maker 0.000%**. ALO is the only default TIF so quotes stay on the maker/rebate side. Optional `REFERRAL_DISCOUNT` multiplies taker only (default 0 — 返佣 is not hardcoded). Optional `MAKER_REBATE_BPS` credits ALO fills (official maker-share tiers: 0.1 / 0.2 / 0.3 bp). The live command prints this estimate before every signed order.
 
 4. Markets are **isolated-only** (`onlyIsolated`, `marginMode=strictIsolated`). Collateral is Hyperliquid USDC (`collateralToken` 0). Live mode sets isolated leverage per coin and never uses cross.
 
@@ -61,7 +61,7 @@ python -m entropy_bot live            # refuses unless LIVE=1 and a key
 python -m entropy_bot cancel          # cancel this bot's cloIDs (needs key)
 ```
 
-`status` prints io meta, mark / oracle / mid, funding, open interest, 24h volume, best bid/ask, spread in bps, and the growth-mode fee estimate for both coins.
+`status` prints io meta, mark / oracle / mid, funding, open interest, 24h volume, best bid/ask, spread in bps, fee tier, growth mode, all-in taker/maker, and that default TIF is ALO — for **both** `io:ANTH` and `io:SNDK`.
 
 ### Config (env / `.env`)
 
@@ -74,6 +74,9 @@ python -m entropy_bot cancel          # cancel this bot's cloIDs (needs key)
 | `QUOTE_NOTIONAL_USD` | `50` | Paper notional per side |
 | `QUOTE_OFFSET_TICKS` | `2` | ALO distance behind the touch |
 | `MAX_LEVERAGE` | `2` | Capped below each market max (ANTH 3 / SNDK 10) |
+| `FEE_TIER` | `4` | Official perp volume tier (tier 4 = 0.028% / 0%) |
+| `REFERRAL_DISCOUNT` | `0` | Taker-only: `taker * (1 - discount)`. Do not invent 返佣 |
+| `MAKER_REBATE_BPS` | unset | Optional ALO rebate in bp (0.1 = -0.001%). Else maker = 0 |
 | `HYPERLIQUID_API_URL` | official mainnet | Official host required |
 | `HYPERLIQUID_WS_URL` | official mainnet | Official host required |
 
@@ -85,7 +88,7 @@ Live quotes use a **tiny** notional (`min(QUOTE_NOTIONAL_USD, 15)`, at least the
 pytest
 ```
 
-Coverage includes coin-name resolution, growth-mode fee math, ALO payloads with asset IDs from mocked `perpDexs`+`meta`, live-mode refusal without a key, and a hard ban on emitting `xyz:SNDK`.
+Coverage includes coin-name resolution, **tier-4 + growth-mode fee math**, optional referral/rebate layers, ALO payloads with asset IDs from mocked `perpDexs`+`meta`, live-mode refusal without a key, and a hard ban on emitting `xyz:SNDK`.
 
 ---
 
@@ -106,7 +109,7 @@ DEX 名称是 **`io`**，全称 EntropyIO。不要用 `xyz` 或 `vntl`。
 
 1. **一条 WebSocket** 同时订 `io:ANTH` 和 `io:SNDK` 的 `l2Book`；REST 只用于 `perpDexs`、带 `dex:"io"` 的 `meta` / `metaAndAssetCtxs`、以及用户逐仓状态。REST 要克制。
 2. **默认 TIF 是 ALO**（只挂不吃）。不会默认 IOC / 市价。
-3. **Growth Mode**：`deployerFeeScale=1` → HIP-3 `scaleIfHip3=2`，再乘 growth `0.1`。0 档大约是 **taker 0.009% / maker 0.003%**。实盘下单前会打印预估手续费。
+3. **Growth Mode + volume 4 档**：`deployerFeeScale=1` → HIP-3 `scaleIfHip3=2`，再乘 growth `0.1`。官方永续 4 档底价 taker 0.028% / maker 0%。全部算完约 **taker 0.0056% / maker 0%**。默认只挂 **ALO**，走 maker/返佣一侧。`REFERRAL_DISCOUNT` 只乘 taker（默认 0，不写死返佣）。`MAKER_REBATE_BPS` 可选，设置后才把 maker 返佣记到 ALO 成交上。实盘下单前会打印预估手续费。
 4. **默认纸交易 / 影子模式**。只有 `LIVE=1` 且设置了 `HYPERLIQUID_PRIVATE_KEY` 才会签名实盘单。
 5. 这两个市场都是 **strictIsolated**。保证金是 Hyperliquid USDC（`collateralToken` 0）。实盘按币设置逐仓杠杆。
 

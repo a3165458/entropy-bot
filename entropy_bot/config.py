@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 
 from entropy_bot.coins import ALLOWED_COINS, validate_coin_list
 from entropy_bot.errors import ConfigError, LiveGuardError
+from entropy_bot.fees import DEFAULT_FEE_TIER, rates_for_tier
 
 DEFAULT_API_URL = "https://api.hyperliquid.xyz"
 DEFAULT_WS_URL = "wss://api.hyperliquid.xyz/ws"
@@ -29,6 +30,9 @@ class Settings:
     max_leverage: int
     api_url: str
     ws_url: str
+    fee_tier: int = DEFAULT_FEE_TIER
+    referral_discount: float = 0.0
+    maker_rebate_bps: float | None = None
 
     @property
     def paper(self) -> bool:
@@ -54,10 +58,17 @@ def load_settings(dotenv_path: str | Path | None = None) -> Settings:
         notional = float(os.environ.get("QUOTE_NOTIONAL_USD", DEFAULT_NOTIONAL))
         offset = int(os.environ.get("QUOTE_OFFSET_TICKS", DEFAULT_OFFSET_TICKS))
         max_lev = int(os.environ.get("MAX_LEVERAGE", DEFAULT_MAX_LEVERAGE))
+        fee_tier = int(os.environ.get("FEE_TIER", DEFAULT_FEE_TIER))
+        referral = float(os.environ.get("REFERRAL_DISCOUNT", "0") or 0)
+        rebate_raw = _optional_env("MAKER_REBATE_BPS")
+        rebate_bps = float(rebate_raw) if rebate_raw is not None else None
     except ValueError as exc:
         raise ConfigError(f"invalid numeric config: {exc}") from exc
     if notional <= 0 or offset < 0 or max_lev < 1:
         raise ConfigError("QUOTE_NOTIONAL_USD, QUOTE_OFFSET_TICKS, MAX_LEVERAGE must be positive")
+    rates_for_tier(fee_tier)
+    if not 0.0 <= referral < 1.0:
+        raise ConfigError("REFERRAL_DISCOUNT must be in [0, 1)")
     api_url = _optional_env("HYPERLIQUID_API_URL") or DEFAULT_API_URL
     ws_url = _optional_env("HYPERLIQUID_WS_URL") or DEFAULT_WS_URL
     if "hyperliquid.xyz" not in api_url or "hyperliquid.xyz" not in ws_url:
@@ -72,6 +83,9 @@ def load_settings(dotenv_path: str | Path | None = None) -> Settings:
         max_leverage=max_lev,
         api_url=api_url.rstrip("/"),
         ws_url=ws_url,
+        fee_tier=fee_tier,
+        referral_discount=referral,
+        maker_rebate_bps=rebate_bps,
     )
 
 

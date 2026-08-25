@@ -6,7 +6,13 @@ import time
 
 from entropy_bot.coins import ALLOWED_DEX, perp_dex_info
 from entropy_bot.config import Settings
-from entropy_bot.fees import estimate_market_fees
+from entropy_bot.fees import (
+    ALO_TIF_NOTE,
+    alo_fill_rebate_usd,
+    describe_fee_model,
+    estimate_from_settings,
+    fee_for_notional,
+)
 from entropy_bot.quoting import (
     PaperState,
     book_top,
@@ -27,15 +33,17 @@ def run_paper(settings: Settings, *, seconds: float | None = None) -> int:
         _meta, markets, _ctxs = load_io_markets(client, settings.coins)
         dex = perp_dex_info(client.perp_dexs(), ALLOWED_DEX)
         log.info(
-            "paper mode (no signing)  dex=%s/%s  coins=%s  notional=$%s  offset=%s ticks",
+            "paper mode (no signing)  dex=%s/%s  coins=%s  notional=$%s  offset=%s ticks  isolated-only",
             dex.get("name"),
             dex.get("fullName"),
             ",".join(settings.coins),
             settings.quote_notional_usd,
             settings.quote_offset_ticks,
         )
+        log.info("%s", describe_fee_model(settings))
+        log.info("%s", ALO_TIF_NOTE)
         for market in markets.values():
-            log.info("%s asset=%s  %s", market.coin, market.asset_id, estimate_market_fees(market).summary())
+            log.info("%s asset=%s  %s", market.coin, market.asset_id, estimate_from_settings(market, settings).summary())
         if settings.account:
             state = client.clearinghouse_state(settings.account, ALLOWED_DEX)
             log.info("isolated snapshot keys=%s", list(state)[:8])
@@ -50,14 +58,28 @@ def run_paper(settings: Settings, *, seconds: float | None = None) -> int:
         top = book_top(coin, data)
         fills = detect_paper_fills(paper, top)
         for fill in fills:
+            notional = fill.px * fill.sz
+            fee = estimate_from_settings(market, settings)
+            maker_usd = fee_for_notional(fee, notional, maker=True)
+            if settings.maker_rebate_bps is not None:
+                credit = alo_fill_rebate_usd(notional, settings.maker_rebate_bps)
+                rebate_txt = (
+                    f"ALO rebate credit ${credit:.6f} "
+                    f"({settings.maker_rebate_bps:g} bp) maker all-in {fee.maker_pct:.4f}%"
+                )
+            else:
+                rebate_txt = f"ALO maker all-in {fee.maker_pct:.4f}% (${maker_usd:.6f}, no extra rebate)"
             log.info(
-                "PAPER FILL %s %s sz=%s px=%s (%s) pos=%s",
+                "PAPER FILL %s %s sz=%s px=%s notional=$%.2f (%s) pos=%s  %s  %s",
                 fill.coin,
                 "BUY" if fill.side == "B" else "SELL",
                 fill.sz,
                 fill.px,
+                notional,
                 fill.reason,
                 paper.position.get(fill.coin),
+                rebate_txt,
+                ALO_TIF_NOTE,
             )
         intents = desired_quotes(
             market,

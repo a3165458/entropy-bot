@@ -10,7 +10,7 @@ from entropy_bot.coins import (
     resolve_markets,
 )
 from entropy_bot.config import Settings
-from entropy_bot.fees import estimate_market_fees
+from entropy_bot.fees import ALO_TIF_NOTE, describe_fee_model, estimate_from_settings, estimate_market_fees
 from entropy_bot.precision import spread_bps
 from entropy_bot.quoting import book_top
 from entropy_bot.rest import InfoClient
@@ -50,21 +50,26 @@ def format_status(
     ctxs: list[Any],
     books: dict[str, Any],
     user_state: dict[str, Any] | None = None,
+    settings: Settings | None = None,
 ) -> str:
     lines = [
         f"DEX {dex_info.get('name')} ({dex_info.get('fullName')})  "
         f"perp_dex_index={next(iter(markets.values())).perp_dex_index}  "
         f"collateralToken={next(iter(markets.values())).collateral_token} (USDC)",
+        f"coins: {', '.join(markets)}  isolated-only",
         f"ignored delisted: {', '.join(DELISTED_COINS)}",
-        "",
+        f"{ALO_TIF_NOTE}",
     ]
+    if settings is not None:
+        lines.append(describe_fee_model(settings))
+    lines.append("")
     for coin in markets:
         m = markets[coin]
         ctx = _ctx_for(markets, ctxs, coin)
         top = book_top(coin, books.get(coin) or {"levels": [[], []]})
         bid, ask = top.bid, top.ask
         spr = spread_bps(bid, ask) if bid and ask else None
-        fee = estimate_market_fees(m)
+        fee = estimate_from_settings(m, settings) if settings is not None else estimate_market_fees(m)
         lines.extend(
             [
                 f"{coin}  asset={m.asset_id}  szDecimals={m.sz_decimals}  "
@@ -96,7 +101,7 @@ def run_status(settings: Settings) -> int:
         user_state = None
         if settings.account:
             user_state = client.clearinghouse_state(settings.account, ALLOWED_DEX)
-        print(format_status(dex, markets, ctxs, books, user_state))
+        print(format_status(dex, markets, ctxs, books, user_state, settings))
         return 0
     finally:
         client.close()

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import os
-
 import pytest
 
 from entropy_bot.cli import main
@@ -55,6 +53,23 @@ def test_paper_does_not_require_key(monkeypatch):
     settings = load_settings()
     assert settings.private_key is None
     assert settings.paper is True
+    assert settings.coins == ("io:ANTH", "io:SNDK")
+    assert settings.fee_tier == 4
+    assert settings.referral_discount == 0.0
+    assert settings.maker_rebate_bps is None
+
+
+def test_fee_env_optional_layers(monkeypatch):
+    from entropy_bot.config import load_settings
+
+    monkeypatch.setenv("COINS", "io:ANTH,io:SNDK")
+    monkeypatch.setenv("FEE_TIER", "4")
+    monkeypatch.setenv("REFERRAL_DISCOUNT", "0.04")
+    monkeypatch.setenv("MAKER_REBATE_BPS", "0.3")
+    settings = load_settings()
+    assert settings.fee_tier == 4
+    assert settings.referral_discount == 0.04
+    assert settings.maker_rebate_bps == 0.3
     assert settings.coins == ("io:ANTH", "io:SNDK")
 
 

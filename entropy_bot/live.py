@@ -7,7 +7,13 @@ from typing import Any
 
 from entropy_bot.coins import ALLOWED_DEX, Market, perp_dex_info
 from entropy_bot.config import Settings, live_notional, require_live
-from entropy_bot.fees import estimate_market_fees, fee_for_notional
+from entropy_bot.fees import (
+    ALO_TIF_NOTE,
+    alo_fill_rebate_usd,
+    describe_fee_model,
+    estimate_from_settings,
+    fee_for_notional,
+)
 from entropy_bot.orders import LiveSigner, format_fee_banner, is_bot_cloid
 from entropy_bot.quoting import QuoteIntent, book_top, desired_quotes
 from entropy_bot.rest import InfoClient
@@ -35,9 +41,17 @@ class LiveQuoter:
 
     def bootstrap_isolated(self) -> None:
         for market in self.markets.values():
-            fee = estimate_market_fees(market)
+            fee = estimate_from_settings(market, self.settings)
             maker_usd = fee_for_notional(fee, self.notional, maker=True)
-            print(format_fee_banner(market.coin, fee.summary(), self.notional, maker_usd), flush=True)
+            rebate_usd = (
+                alo_fill_rebate_usd(self.notional, self.settings.maker_rebate_bps)
+                if self.settings.maker_rebate_bps is not None
+                else None
+            )
+            print(
+                format_fee_banner(market.coin, fee.summary(), self.notional, maker_usd, rebate_usd),
+                flush=True,
+            )
             payload = self.signer.signed_update_leverage(market, self.settings.max_leverage)
             resp = self.client.post_exchange(payload)
             log.info("isolated leverage %s -> %s", market.coin, resp)
@@ -79,9 +93,14 @@ class LiveQuoter:
             log.info("cancel prior ALO %s %s", coin, resp)
         specs = []
         recorded: dict[str, tuple[str, float, float]] = {}
-        fee = estimate_market_fees(market)
+        fee = estimate_from_settings(market, self.settings)
         maker_usd = fee_for_notional(fee, self.notional, maker=True)
-        print(format_fee_banner(coin, fee.summary(), self.notional, maker_usd), flush=True)
+        rebate_usd = (
+            alo_fill_rebate_usd(self.notional, self.settings.maker_rebate_bps)
+            if self.settings.maker_rebate_bps is not None
+            else None
+        )
+        print(format_fee_banner(coin, fee.summary(), self.notional, maker_usd, rebate_usd), flush=True)
         for intent in intents:
             cloid = self.signer.next_cloid(intent.coin, intent.side)  # type: ignore[arg-type]
             specs.append((market, intent.is_buy, intent.px, intent.sz, cloid))
@@ -100,12 +119,15 @@ def run_live(settings: Settings, *, seconds: float | None = None) -> int:
         _meta, markets, _ctxs = load_io_markets(client, settings.coins)
         dex = perp_dex_info(client.perp_dexs(), ALLOWED_DEX)
         log.info(
-            "LIVE isolated quoting  dex=%s/%s  account=%s  notional=$%s",
+            "LIVE isolated quoting  dex=%s/%s  account=%s  notional=$%s  coins=%s",
             dex.get("name"),
             dex.get("fullName"),
             signer.account,
             live_notional(settings),
+            ",".join(settings.coins),
         )
+        log.info("%s", describe_fee_model(settings))
+        log.info("%s", ALO_TIF_NOTE)
         user_state = client.clearinghouse_state(signer.account, ALLOWED_DEX)
         log.info("isolated user state withdrawable=%s", user_state.get("withdrawable"))
         quoter = LiveQuoter(settings, markets, client, signer)

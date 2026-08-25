@@ -162,8 +162,17 @@ class LiveSigner:
         return sign_and_wrap(self.wallet, update_leverage_action(market, leverage))
 
 
-def format_fee_banner(coin: str, fee_line: str, notional: float, maker_usd: float) -> str:
+def format_fee_banner(
+    coin: str,
+    fee_line: str,
+    notional: float,
+    maker_usd: float,
+    rebate_usd: float | None = None,
+) -> str:
+    extra = ""
+    if rebate_usd is not None:
+        extra = f" → ALO rebate credit ${rebate_usd:.6f}"
     return (
-        f"FEE before live order {coin}: {fee_line} | "
-        f"quote ${notional:.2f} → est maker ${maker_usd:.6f}"
+        f"FEE before live ALO order {coin}: {fee_line} | "
+        f"quote ${notional:.2f} → est maker ${maker_usd:.6f}{extra}"
     )

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Entropy Desk · ANTH / SNDK
 // @namespace    entropy-desk
-// @version      1.5.9
+// @version      1.6.0
 // @description  ALO-quote io:ANTH / io:SNDK; flatten escalate ALO→mid→IOC take
 // @match        https://entropy.io/*
 // @match        https://app.hyperliquid.xyz/*
@@ -1203,11 +1203,94 @@
   function addExtraOid(coin, oid) {
     if (oid == null) return;
     var s = oidSlot(coin);
-    if (s.buy === oid || s.sell === oid) return;
+    if (s.buy != null && String(s.buy) === String(oid)) return;
+    if (s.sell != null && String(s.sell) === String(oid)) return;
     if (!state.extraOids[coin]) state.extraOids[coin] = [];
     var extras = state.extraOids[coin];
     for (var i = 0; i < extras.length; i++) if (String(extras[i]) === String(oid)) return;
     extras.push(oid);
+  }
+  function scheduleRequote(coin, reason) {
+    if (!autoOn(coin)) return;
+    if (state.requoteBusy[coin] || state.inFlight) {
+      state.needsRequote[coin] = true;
+      return;
+    }
+    requoteCoin(coin).catch(function (eR) { warn(reason || "requote", eR && eR.message); });
+  }
+  async function cancelCoinRests(coin) {
+    try {
+      await cancelAllForCoin(coin, currentWallet(), { refetch: true });
+    } catch (eC) {
+      warn("撤旧挂单", coin, eC && eC.message);
+      var cached = listCachedOids(coin);
+      if (cached.length) {
+        try { await cancelOids(coin, cached); } catch (e2) { warn("撤缓存", e2 && e2.message); }
+      }
+    }
+    clearOids(coin);
+  }
+  async function sweepExtraOids(coin) {
+    var slot = oidSlot(coin);
+    var keepBuy = slot.buy;
+    var keepSell = slot.sell;
+    var extras = (state.extraOids[coin] || []).slice();
+    try {
+      var user = "";
+      try { user = masterUser(); } catch (eU) { user = currentWallet() || ""; }
+      if (user) {
+        var opens = await fetchOpenOrders(user);
+        if (opens) {
+          var ours = coinOpenOrders(opens, coin);
+          var buys = [];
+          var sells = [];
+          var i;
+          for (i = 0; i < ours.length; i++) {
+            var oid = orderOid(ours[i]);
+            if (oid == null) continue;
+            var isBuy = orderSideBuy(ours[i]);
+            if (isBuy === true) buys.push(oid);
+            else if (isBuy === false) sells.push(oid);
+          }
+          function extrasOf(list, keep) {
+            var out = [];
+            var j;
+            for (j = 0; j < list.length; j++) {
+              if (keep != null && String(list[j]) === String(keep)) continue;
+              out.push(list[j]);
+            }
+            return out;
+          }
+          extras = extras.concat(extrasOf(buys, keepBuy)).concat(extrasOf(sells, keepSell));
+          if (keepBuy == null && buys.length) slot.buy = buys[0];
+          if (keepSell == null && sells.length) slot.sell = sells[0];
+        }
+      }
+    } catch (eF) {
+      warn("扫多余挂单", coin, eF && eF.message);
+    }
+    var kill = [];
+    var seen = {};
+    var k;
+    for (k = 0; k < extras.length; k++) {
+      if (extras[k] == null) continue;
+      var n;
+      try { n = asOid(extras[k]); } catch (eA) { continue; }
+      var ks = String(n);
+      if (seen[ks]) continue;
+      if (slot.buy != null && String(slot.buy) === ks) continue;
+      if (slot.sell != null && String(slot.sell) === ks) continue;
+      seen[ks] = true;
+      kill.push(n);
+    }
+    state.extraOids[coin] = [];
+    if (!kill.length) return;
+    try {
+      await cancelOids(coin, kill);
+      log("撤多余 " + coin + " n=" + kill.length + " oids=" + kill.join(",") + " dex:" + DEX);
+    } catch (eX) {
+      warn("撤多余", coin, eX && eX.message);
+    }
   }
   function quoteKey(px, plan) {
     var k = String(px && px.buy != null ? px.buy : "") + "|" + String(px && px.sell != null ? px.sell : "");
@@ -1441,8 +1524,13 @@
   function ingestSideOid(coin, isBuy, oid) {
     if (oid == null) return;
     var s = oidSlot(coin);
-    if (isBuy) s.buy = oid;
-    else s.sell = oid;
+    if (isBuy) {
+      if (s.buy != null && String(s.buy) !== String(oid)) addExtraOid(coin, s.buy);
+      s.buy = oid;
+    } else {
+      if (s.sell != null && String(s.sell) !== String(oid)) addExtraOid(coin, s.sell);
+      s.sell = oid;
+    }
   }
   function ingestOrderStatuses(coin, orders, resp) {
     var sts = respStatuses(resp);
@@ -1512,7 +1600,7 @@
         state.lastQuoted[coin] = "";
         state.needsRequote[coin] = true;
         state.posForce = true;
-        requoteCoin(coin).catch(function (eF) { warn("成交补挂", eF && eF.message); });
+        scheduleRequote(coin, "成交补挂");
       }
       return;
     }
@@ -1570,12 +1658,12 @@
       var planW = flattenPlan(coin, q);
       var staleFlat = planW.mode === "flat" && state.quotePlacedAt[coin] && (nowMs() - state.quotePlacedAt[coin] > STALE_QUOTE_MS);
       if (planW.take || staleFlat) {
-        requoteCoin(coin).catch(function (eR) { warn("ws requote", eR && eR.message); });
+        scheduleRequote(coin, "ws requote");
         return;
       }
       if (!planW.px) return;
       var key = quoteKey(planW.px, planW);
-      if (key !== state.lastQuoted[coin]) requoteCoin(coin).catch(function (eR) { warn("ws requote", eR && eR.message); });
+      if (key !== state.lastQuoted[coin]) scheduleRequote(coin, "ws requote");
     } catch (ePx) {}
   }
   function handleWsMsg(raw) {
@@ -1665,43 +1753,98 @@
       }
       return { iocFail: true, skipped: true };
     }
-    var orders = [];
+    var slot = oidSlot(coin);
     var buySz = plan.buySz;
     var sellSz = plan.sellSz;
-    if (wantBuy && plan.wantBuy) orders.push({ a: q.assetId, b: true, p: px.buy, s: buySz, r: !!plan.buyR, tif: tif });
-    if (wantSell && plan.wantSell) orders.push({ a: q.assetId, b: false, p: px.sell, s: sellSz, r: !!plan.sellR, tif: tif });
-    if (!orders.length) return null;
-    var resp = await sendSignedAction(buildOrderAction(orders));
-    if (aloPxReject(resp)) {
-      if (take) {
-        warn("IOC 平仓未成", coin, resp && (resp.message || resp));
-        return { iocFail: true, resp: resp };
-      }
-      markAloReject(coin, resp);
-      return { aloReject: true, resp: resp };
+    var willBuy = !!(wantBuy && plan.wantBuy);
+    var willSell = !!(wantSell && plan.wantSell);
+    if (!willBuy && !willSell) return null;
+    var mods = [];
+    if (willBuy && slot.buy != null) {
+      mods.push(modifyWire(slot.buy, { a: q.assetId, b: true, p: px.buy, s: buySz, r: !!plan.buyR, tif: tif }));
+      willBuy = false;
     }
-    if (!actionOk(resp)) {
-      if (take) {
-        warn("IOC 平仓失败", coin, resp && (resp.message || resp));
-        return { iocFail: true, resp: resp };
-      }
-      throw new Error("下单失败 " + JSON.stringify(resp));
+    if (willSell && slot.sell != null) {
+      mods.push(modifyWire(slot.sell, { a: q.assetId, b: false, p: px.sell, s: sellSz, r: !!plan.sellR, tif: tif }));
+      willSell = false;
     }
-    ingestOrderStatuses(coin, orders, resp);
-    if (take) {
-      var stsI = respStatuses(resp);
-      var ii;
-      for (ii = 0; ii < stsI.length; ii++) {
-        if (statusError(stsI[ii])) {
-          warn("IOC 平仓状态", coin, statusError(stsI[ii]));
-          return { iocFail: true, resp: resp };
+    var lastResp = null;
+    if (mods.length) {
+      lastResp = await sendSignedAction(buildModifyAction(mods));
+      if (aloPxReject(lastResp)) {
+        if (take) {
+          warn("IOC 平仓未成", coin, lastResp && (lastResp.message || lastResp));
+          return { iocFail: true, resp: lastResp };
+        }
+        markAloReject(coin, lastResp);
+        return { aloReject: true, resp: lastResp };
+      }
+      var mst = respStatuses(lastResp);
+      var mi;
+      for (mi = 0; mi < mods.length; mi++) {
+        var merr = statusError(mst[mi]);
+        if (merr || !actionOk(lastResp)) {
+          if (aloPxReject(merr) || aloPxReject(lastResp)) {
+            if (take) return { iocFail: true, resp: lastResp };
+            markAloReject(coin, merr || lastResp);
+            return { aloReject: true, resp: lastResp };
+          }
+          if (mods[mi].order.b) {
+            slot.buy = null;
+            willBuy = !!(wantBuy && plan.wantBuy);
+          } else {
+            slot.sell = null;
+            willSell = !!(wantSell && plan.wantSell);
+          }
+        } else {
+          var moid = statusOid(mst[mi]);
+          if (moid != null) ingestSideOid(coin, mods[mi].order.b, moid);
         }
       }
     }
-    log((take ? "吃单 " : "挂单 ") + coin + (wantBuy && plan.wantBuy ? " 买 " + buySz + " @ " + px.buy + (plan.buyR ? " ro" : "") : "") + (wantSell && plan.wantSell ? " 卖 " + sellSz + " @ " + px.sell + (plan.sellR ? " ro" : "") : "") + " " + tif);
-    return resp;
+    var orders = [];
+    if (willBuy) {
+      if (slot.buy != null) warn("拒绝重复挂买", coin, slot.buy);
+      else orders.push({ a: q.assetId, b: true, p: px.buy, s: buySz, r: !!plan.buyR, tif: tif });
+    }
+    if (willSell) {
+      if (slot.sell != null) warn("拒绝重复挂卖", coin, slot.sell);
+      else orders.push({ a: q.assetId, b: false, p: px.sell, s: sellSz, r: !!plan.sellR, tif: tif });
+    }
+    if (orders.length) {
+      lastResp = await sendSignedAction(buildOrderAction(orders));
+      if (aloPxReject(lastResp)) {
+        if (take) {
+          warn("IOC 平仓未成", coin, lastResp && (lastResp.message || lastResp));
+          return { iocFail: true, resp: lastResp };
+        }
+        markAloReject(coin, lastResp);
+        return { aloReject: true, resp: lastResp };
+      }
+      if (!actionOk(lastResp)) {
+        if (take) {
+          warn("IOC 平仓失败", coin, lastResp && (lastResp.message || lastResp));
+          return { iocFail: true, resp: lastResp };
+        }
+        throw new Error("下单失败 " + JSON.stringify(lastResp));
+      }
+      ingestOrderStatuses(coin, orders, lastResp);
+      if (take) {
+        var stsI = respStatuses(lastResp);
+        var ii;
+        for (ii = 0; ii < stsI.length; ii++) {
+          if (statusError(stsI[ii])) {
+            warn("IOC 平仓状态", coin, statusError(stsI[ii]));
+            return { iocFail: true, resp: lastResp };
+          }
+        }
+      }
+      log((take ? "吃单 " : "挂单 ") + coin + (wantBuy && plan.wantBuy ? " 买 " + buySz + " @ " + px.buy + (plan.buyR ? " ro" : "") : "") + (wantSell && plan.wantSell ? " 卖 " + sellSz + " @ " + px.sell + (plan.sellR ? " ro" : "") : "") + " " + tif);
+    }
+    try { await sweepExtraOids(coin); } catch (eSw) { warn("扫多余", coin, eSw && eSw.message); }
+    return lastResp;
   }
-  async function requoteCoin(coin) {
+  async function requoteCoin(coin, followUp) {
     coin = assertAllowedCoin(coin);
     if (!autoOn(coin)) return;
     if (state.requoteBusy[coin] || state.inFlight) {
@@ -1722,11 +1865,7 @@
       plan = flattenPlan(coin, q);
       var px = plan.px;
       if (plan.take) {
-        var takeOids = listCachedOids(coin);
-        if (takeOids.length) {
-          try { await cancelOids(coin, takeOids); } catch (eTk) { warn("撤 ALO 准备吃单", eTk && eTk.message); }
-          clearOids(coin);
-        }
+        await cancelCoinRests(coin);
         if (!autoOn(coin)) return;
         var nowT = nowMs();
         if (state.lastTakeAt[coin] && nowT - state.lastTakeAt[coin] < POLL_MS) {
@@ -1765,83 +1904,25 @@
       var key = quoteKey(px, plan);
       var slot = oidSlot(coin);
       var extras = state.extraOids[coin] || [];
-      if (extras.length) {
-        try { await cancelOids(coin, extras.slice()); } catch (eX) { warn("撤多余", eX && eX.message); }
-        state.extraOids[coin] = [];
-        if (!autoOn(coin)) return;
-      }
-      var kill = [];
-      if (!plan.wantBuy && slot.buy != null) kill.push(slot.buy);
-      if (!plan.wantSell && slot.sell != null) kill.push(slot.sell);
-      if (kill.length) {
-        await cancelOids(coin, kill);
-        if (!plan.wantBuy) slot.buy = null;
-        if (!plan.wantSell) slot.sell = null;
-        if (!autoOn(coin)) return;
-      }
       var haveBuy = slot.buy != null;
       var haveSell = slot.sell != null;
       var wantBuy = !!plan.wantBuy;
       var wantSell = !!plan.wantSell;
-      if (haveBuy === wantBuy && haveSell === wantSell && key === state.lastQuoted[coin]) {
-        var stale = plan.mode === "flat" && state.quotePlacedAt[coin] && (nowMs() - state.quotePlacedAt[coin] > STALE_QUOTE_MS);
-        if (!stale) {
-          await maybeDeadMan();
-          return;
+      var stale = plan.mode === "flat" && state.quotePlacedAt[coin] && (nowMs() - state.quotePlacedAt[coin] > STALE_QUOTE_MS);
+      var sameCoverage = haveBuy === wantBuy && haveSell === wantSell;
+      if (sameCoverage && key === state.lastQuoted[coin] && !stale) {
+        if (extras.length) {
+          try { await sweepExtraOids(coin); } catch (eX0) { warn("撤多余", eX0 && eX0.message); }
         }
-        log("空仓报价过旧，撤后重挂", coin);
-        var staleOids = listCachedOids(coin);
-        if (staleOids.length) {
-          try { await cancelOids(coin, staleOids); } catch (eSt) { warn("撤过旧报价", eSt && eSt.message); }
-          clearOids(coin);
-          slot = oidSlot(coin);
-          haveBuy = false;
-          haveSell = false;
-        }
-        state.lastQuoted[coin] = "";
-        state.quotePlacedAt[coin] = 0;
+        await maybeDeadMan();
+        return;
       }
-      var buySz = plan.buySz;
-      var sellSz = plan.sellSz;
-      var mods = [];
-      var prev = String(state.lastQuoted[coin] || "").split("|");
-      if (wantBuy && haveBuy && (!pxEqual(prev[0], px.buy) || String(prev[2] || "") !== String(buySz))) {
-        mods.push(modifyWire(slot.buy, { a: q.assetId, b: true, p: px.buy, s: buySz, r: !!plan.buyR, tif: plan.tif || "Alo" }));
-      }
-      if (wantSell && haveSell && (!pxEqual(prev[1], px.sell) || String(prev[3] || "") !== String(sellSz))) {
-        mods.push(modifyWire(slot.sell, { a: q.assetId, b: false, p: px.sell, s: sellSz, r: !!plan.sellR, tif: plan.tif || "Alo" }));
-      }
-      if (mods.length) {
-        if (!autoOn(coin)) return;
-        var resp = await sendSignedAction(buildModifyAction(mods));
-        if (aloPxReject(resp)) {
-          markAloReject(coin, resp);
-          deferRequote = true;
-          return;
-        }
-        var sts = respStatuses(resp);
-        var i;
-        for (i = 0; i < mods.length; i++) {
-          var err = statusError(sts[i]);
-          if (err || !actionOk(resp)) {
-            if (aloPxReject(err) || aloPxReject(resp)) {
-              markAloReject(coin, err || resp);
-              deferRequote = true;
-              return;
-            }
-            if (mods[i].order.b) slot.buy = null;
-            else slot.sell = null;
-          } else {
-            var oid = statusOid(sts[i]);
-            if (oid != null) ingestSideOid(coin, mods[i].order.b, oid);
-          }
-        }
-      }
+      if (stale) log("空仓报价过旧，撤后重挂", coin);
+      else if (key !== state.lastQuoted[coin] || !sameCoverage) log("计划变更，先撤再挂", coin, plan.stage, plan.tif);
+      await cancelCoinRests(coin);
       if (!autoOn(coin)) return;
-      var needBuy = wantBuy && slot.buy == null;
-      var needSell = wantSell && slot.sell == null;
-      if (needBuy || needSell) {
-        var placed = await placeSides(coin, q, px, needBuy, needSell, plan);
+      if (wantBuy || wantSell) {
+        var placed = await placeSides(coin, q, px, wantBuy, wantSell, plan);
         if (placed && (placed.aloReject || placed.skipped)) {
           deferRequote = true;
           return;
@@ -1869,9 +1950,9 @@
       throw eReq;
     } finally {
       state.requoteBusy[coin] = false;
-      if (!deferRequote && state.needsRequote[coin] && autoOn(coin)) {
+      if (!followUp && !deferRequote && state.needsRequote[coin] && autoOn(coin)) {
         state.needsRequote[coin] = false;
-        requoteCoin(coin).catch(function (eN) { warn("needsRequote", eN && eN.message); });
+        requoteCoin(coin, true).catch(function (eN) { warn("needsRequote", eN && eN.message); });
       }
     }
   }
@@ -2624,7 +2705,7 @@
   function buildPanelOnce(box) {
     if (box.getAttribute("data-ed-built") === "1") return;
     box.setAttribute("data-ed-built", "1");
-    box.appendChild(el("div", { class: "ed-top" }, [el("div", { class: "ed-title", text: "Entropy Desk · ANTH / SNDK  1.5.9" }), el("span", { class: "ed-muted", id: "ed-wallet", text: shortAddr(currentWallet()) })]));
+    box.appendChild(el("div", { class: "ed-top" }, [el("div", { class: "ed-title", text: "Entropy Desk · ANTH / SNDK  1.6.0" }), el("span", { class: "ed-muted", id: "ed-wallet", text: shortAddr(currentWallet()) })]));
     box.appendChild(el("div", { class: "ed-fees", text: "净手续费  taker ≈ 0   maker 0\nHL档4 0.028% × HIP-3×2 × growth×0.1 − Entropy自返200%×50%份额" }));
     var inp = el("input", { type: "number", min: "10", step: "1", value: String(state.notional), id: "ed-notional" });
     inp.addEventListener("change", function () { var v = Number(inp.value); if (v > 0) state.notional = v; });
@@ -2692,9 +2773,9 @@
       render();
     } finally { state.polling = false; }
   }
-  window.EntropyDesk = { version: "1.5.9", state: state, fee: FEE, refresh: tick, paperBoth: paperBoth, liveBoth: liveBoth, liveOrder: liveOrder, approveBuilder: approveBuilder, openTrade: openTrade, assertAllowedCoin: assertAllowedCoin, printFees: printFees, setAutoMm: setAutoMm, setAutoCoin: setAutoCoin, cancelCoinOrders: cancelCoinOrders, cancelAllDesk: cancelAllDesk, aloPrices: aloPrices, clampMakerPx: clampMakerPx, aloPxReject: aloPxReject };
+  window.EntropyDesk = { version: "1.6.0", state: state, fee: FEE, refresh: tick, paperBoth: paperBoth, liveBoth: liveBoth, liveOrder: liveOrder, approveBuilder: approveBuilder, openTrade: openTrade, assertAllowedCoin: assertAllowedCoin, printFees: printFees, setAutoMm: setAutoMm, setAutoCoin: setAutoCoin, cancelCoinOrders: cancelCoinOrders, cancelAllDesk: cancelAllDesk, aloPrices: aloPrices, clampMakerPx: clampMakerPx, aloPxReject: aloPxReject };
   printFees();
-  log("已加载 1.5.9。空仓双边 ALO，有仓 reduce-only：<6s 远档 ALO，6–15s 中间 ALO，≥15s 撤后 IOC 吃单平仓。空仓同价挂 45s 无成交则重挂。ALO 价被拒则跟新盘口重挂。IOC 失败不停止。dead-man 20s 账户级，停止时清除。");
+  log("已加载 1.6.0。每币最多 1 买 + 1 卖。阶段/tif/价变先撤再挂。空仓双边 ALO，有仓 reduce-only：<6s 远档 ALO，6–15s 中间 ALO，≥15s 撤后 IOC 吃单平仓。空仓同价挂 45s 无成交则重挂。ALO 价被拒则跟新盘口重挂。IOC 失败不停止。dead-man 20s 账户级，停止时清除。");
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", function () { render(); tick(); });
   else { render(); tick(); }
   setInterval(tick, POLL_MS);

@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Entropy Desk · ANTH / SNDK
 // @namespace    entropy-desk
-// @version      1.6.0
-// @description  ALO-quote io:ANTH / io:SNDK; flatten escalate ALO→mid→IOC take
+// @version      1.6.1
+// @description  ALO-quote io:ANTH / io:SNDK; sit inside wide HIP-3; flatten ALO→mid→IOC
 // @match        https://entropy.io/*
 // @match        https://app.hyperliquid.xyz/*
 // @run-at       document-idle
@@ -255,6 +255,14 @@
     return floatToWire(limited);
   }
   function tickSize(px, szDecimals) {
+    var n = Number(px);
+    if (Number.isFinite(n) && n > 0) {
+      var maxDec = Math.max(0, 6 - (szDecimals | 0));
+      var sigTick = Math.pow(10, Math.floor(Math.log10(n) + 1e-12) - 4);
+      var decTick = Math.pow(10, -maxDec);
+      var t = Math.max(sigTick, decTick);
+      if (Number.isFinite(t) && t > 0) return t;
+    }
     var wired = roundPx(px, szDecimals);
     var s = wired.indexOf(".") === -1 ? 0 : wired.split(".")[1].length;
     return Math.pow(10, -s);
@@ -455,7 +463,7 @@
   async function fetchBook(coin) {
     assertAllowedCoin(coin);
     try {
-      var book = await hlInfo({ type: "l2Book", coin: coin, nSigFigs: 5 });
+      var book = await hlInfo({ type: "l2Book", coin: coin });
       var bids = (book && book.levels && book.levels[0]) || [];
       var asks = (book && book.levels && book.levels[1]) || [];
       var bidPx = bids[0] && bids[0].px != null ? String(bids[0].px) : "";
@@ -485,27 +493,74 @@
     state.quotes[coin] = q;
     return q;
   }
+  function quoteMid(q) {
+    var mid = Number(q && q.mid);
+    if (Number.isFinite(mid) && mid > 0) return mid;
+    var bid = Number(q && q.bid);
+    var ask = Number(q && q.ask);
+    if (Number.isFinite(bid) && Number.isFinite(ask) && bid > 0 && ask > 0) return (bid + ask) / 2;
+    mid = Number(q && q.mark);
+    if (Number.isFinite(mid) && mid > 0) return mid;
+    var a0 = state.assets[(q && q.coin) || ""] || {};
+    var ctx0 = a0.ctx || {};
+    mid = Number(ctx0.markPx);
+    if (Number.isFinite(mid) && mid > 0) return mid;
+    mid = Number(ctx0.midPx);
+    if (Number.isFinite(mid) && mid > 0) return mid;
+    return NaN;
+  }
   function aloPrices(q) {
     var szd = q.szDecimals | 0;
     var bidPx = q.bidPx != null && q.bidPx !== "" ? String(q.bidPx) : "";
     var askPx = q.askPx != null && q.askPx !== "" ? String(q.askPx) : "";
-    if (bidPx && askPx && Number(bidPx) < Number(askPx)) {
-      return { buy: bidPx, sell: askPx };
-    }
-    var mid = q.mid;
-    if (!Number.isFinite(mid) || mid <= 0) mid = q.mark;
-    if (!Number.isFinite(mid) || mid <= 0) {
-      var a0 = state.assets[q.coin] || {};
-      var ctx0 = a0.ctx || {};
-      mid = Number(ctx0.markPx);
-      if (!Number.isFinite(mid) || mid <= 0) mid = Number(ctx0.midPx);
-    }
+    var bid = bidPx ? Number(bidPx) : Number(q.bid);
+    var ask = askPx ? Number(askPx) : Number(q.ask);
+    var mid = quoteMid(q);
     if (!Number.isFinite(mid) || mid <= 0) throw new Error(q.coin + " 无可用中间价");
     var tick = tickSize(mid, szd);
-    var buyN = mid - tick;
-    var sellN = mid + tick;
+    function midFallback() {
+      var buyM = mid - tick;
+      var sellM = mid + tick;
+      if (!(buyM > 0)) buyM = tick;
+      return { buy: roundPx(buyM, szd), sell: roundPx(sellM, szd), inside: false };
+    }
+    if (!(Number.isFinite(bid) && Number.isFinite(ask) && bid > 0 && ask > 0 && bid < ask)) {
+      return midFallback();
+    }
+    if (!bidPx) bidPx = roundPx(bid, szd);
+    if (!askPx) askPx = roundPx(ask, szd);
+    var spread = ask - bid;
+    if (spread <= 2 * tick + 1e-12) {
+      return { buy: bidPx, sell: askPx, inside: false };
+    }
+    var buyN = bid + tick;
+    var sellN = ask - tick;
+    var midBuy = mid - tick;
+    var midSell = mid + tick;
+    if (midBuy > buyN) buyN = midBuy;
+    if (midSell < sellN) sellN = midSell;
+    var maxGap = Math.max(2 * tick, mid * 0.0003);
+    if (sellN - buyN > maxGap + 1e-12) {
+      var half = maxGap / 2;
+      buyN = mid - half;
+      sellN = mid + half;
+    }
+    if (buyN <= bid) buyN = bid + tick;
+    if (sellN >= ask) sellN = ask - tick;
+    if (buyN >= ask) buyN = ask - tick;
+    if (sellN <= bid) sellN = bid + tick;
     if (!(buyN > 0)) buyN = tick;
-    return { buy: roundPx(buyN, szd), sell: roundPx(sellN, szd) };
+    if (!(buyN < sellN)) return { buy: bidPx, sell: askPx, inside: false };
+    var buy = roundPx(buyN, szd);
+    var sell = roundPx(sellN, szd);
+    if (!(Number(buy) < Number(sell))) {
+      buy = roundPx(mid - tick, szd);
+      sell = roundPx(mid + tick, szd);
+    }
+    if (Number(buy) >= ask) buy = roundPx(ask - tick, szd);
+    if (Number(sell) <= bid) sell = roundPx(bid + tick, szd);
+    if (!(Number(buy) < Number(sell))) return { buy: bidPx, sell: askPx, inside: false };
+    return { buy: buy, sell: sell, inside: true };
   }
   function wireMin(a, b) {
     return Number(a) <= Number(b) ? String(a) : String(b);
@@ -526,17 +581,17 @@
     var buy = desired && desired.buy != null && desired.buy !== "" ? String(desired.buy) : "";
     var sell = desired && desired.sell != null && desired.sell !== "" ? String(desired.sell) : "";
     if (Number.isFinite(ask) && ask > 0) {
-      var cap = roundPx(Number(ask) - tick, szd);
-      buy = buy ? wireMin(buy, cap) : cap;
+      if (!buy || Number(buy) >= ask) buy = roundPx(Number(ask) - tick, szd);
     }
     if (Number.isFinite(bid) && bid > 0) {
-      var floor = roundPx(Number(bid) + tick, szd);
-      sell = sell ? wireMax(sell, floor) : floor;
+      if (!sell || Number(sell) <= bid) sell = roundPx(Number(bid) + tick, szd);
     }
     if (!buy || !sell) return null;
     if (!(Number(buy) > 0) || !(Number(sell) > 0)) return null;
     if (Number(buy) >= Number(sell)) return null;
-    return { buy: buy, sell: sell };
+    var out = { buy: buy, sell: sell };
+    if (desired && desired.inside) out.inside = true;
+    return out;
   }
   function wantedPx(q) {
     return clampMakerPx(q, aloPrices(q));
@@ -1448,6 +1503,7 @@
       if (!(Number(sell) > 0)) sell = alo.sell;
       return { buy: buy, sell: sell };
     }
+    if (ba.bid && ba.ask) return { buy: ba.bid, sell: ba.ask };
     return { buy: alo.buy, sell: alo.sell };
   }
   function flattenPlan(coin, q, pxHint) {
@@ -1502,7 +1558,12 @@
       if (stage === "mid") return name + " 空 " + fmtSzi(Math.abs(szi)) + " 等平 " + ageS + "s → 挂中间";
       return name + " 空 " + fmtSzi(Math.abs(szi)) + " 等平 " + ageS + "s → 挂买平 @bid";
     }
-    return name + " 空仓 双边";
+    var inside = false;
+    try {
+      var qf = state.quotes[coin];
+      inside = !!(qf && aloPrices(qf).inside);
+    } catch (eIn) {}
+    return name + " 空仓 双边" + (inside ? " 点差过宽·挂内侧" : "");
   }
   function statusOid(st) {
     if (!st || typeof st === "string") return null;
@@ -1630,7 +1691,7 @@
   }
   function subscribeBooks() {
     for (var i = 0; i < ALLOWED.length; i++) {
-      wsSend({ method: "subscribe", subscription: { type: "l2Book", coin: ALLOWED[i], nSigFigs: 5 } });
+      wsSend({ method: "subscribe", subscription: { type: "l2Book", coin: ALLOWED[i] } });
     }
   }
   function subscribeOrders() {
@@ -2705,7 +2766,7 @@
   function buildPanelOnce(box) {
     if (box.getAttribute("data-ed-built") === "1") return;
     box.setAttribute("data-ed-built", "1");
-    box.appendChild(el("div", { class: "ed-top" }, [el("div", { class: "ed-title", text: "Entropy Desk · ANTH / SNDK  1.6.0" }), el("span", { class: "ed-muted", id: "ed-wallet", text: shortAddr(currentWallet()) })]));
+    box.appendChild(el("div", { class: "ed-top" }, [el("div", { class: "ed-title", text: "Entropy Desk · ANTH / SNDK  1.6.1" }), el("span", { class: "ed-muted", id: "ed-wallet", text: shortAddr(currentWallet()) })]));
     box.appendChild(el("div", { class: "ed-fees", text: "净手续费  taker ≈ 0   maker 0\nHL档4 0.028% × HIP-3×2 × growth×0.1 − Entropy自返200%×50%份额" }));
     var inp = el("input", { type: "number", min: "10", step: "1", value: String(state.notional), id: "ed-notional" });
     inp.addEventListener("change", function () { var v = Number(inp.value); if (v > 0) state.notional = v; });
@@ -2723,7 +2784,7 @@
     autoLab.appendChild(autoCk);
     autoLab.appendChild(document.createTextNode(" 全部自动紧贴"));
     box.appendChild(el("div", { class: "ed-row" }, [autoLab]));
-    box.appendChild(el("div", { class: "ed-muted", id: "ed-automm-help", text: "空仓双边；有仓 reduce-only：<6s 远档 ALO，6–15s 中间，≥15s IOC 吃单平仓" }));
+    box.appendChild(el("div", { class: "ed-muted", id: "ed-automm-help", text: "空仓双边（点差过宽挂内侧）；有仓 reduce-only：<6s 远档 ALO，6–15s 中间，≥15s IOC 吃单平仓" }));
     box.appendChild(el("div", { class: "ed-muted", id: "ed-deadman-note", text: "定时撤是账户级，会动到其它市场手单" }));
     box.appendChild(el("div", { class: "ed-muted", id: "ed-mode", text: "自动紧贴：空仓双边，有仓只挂平仓侧" }));
     ALLOWED.forEach(function (c) { box.appendChild(buildCoinCard(c)); });
@@ -2773,9 +2834,9 @@
       render();
     } finally { state.polling = false; }
   }
-  window.EntropyDesk = { version: "1.6.0", state: state, fee: FEE, refresh: tick, paperBoth: paperBoth, liveBoth: liveBoth, liveOrder: liveOrder, approveBuilder: approveBuilder, openTrade: openTrade, assertAllowedCoin: assertAllowedCoin, printFees: printFees, setAutoMm: setAutoMm, setAutoCoin: setAutoCoin, cancelCoinOrders: cancelCoinOrders, cancelAllDesk: cancelAllDesk, aloPrices: aloPrices, clampMakerPx: clampMakerPx, aloPxReject: aloPxReject };
+  window.EntropyDesk = { version: "1.6.1", state: state, fee: FEE, refresh: tick, paperBoth: paperBoth, liveBoth: liveBoth, liveOrder: liveOrder, approveBuilder: approveBuilder, openTrade: openTrade, assertAllowedCoin: assertAllowedCoin, printFees: printFees, setAutoMm: setAutoMm, setAutoCoin: setAutoCoin, cancelCoinOrders: cancelCoinOrders, cancelAllDesk: cancelAllDesk, aloPrices: aloPrices, clampMakerPx: clampMakerPx, aloPxReject: aloPxReject };
   printFees();
-  log("已加载 1.6.0。每币最多 1 买 + 1 卖。阶段/tif/价变先撤再挂。空仓双边 ALO，有仓 reduce-only：<6s 远档 ALO，6–15s 中间 ALO，≥15s 撤后 IOC 吃单平仓。空仓同价挂 45s 无成交则重挂。ALO 价被拒则跟新盘口重挂。IOC 失败不停止。dead-man 20s 账户级，停止时清除。");
+  log("已加载 1.6.1。每币最多 1 买 + 1 卖。阶段/tif/价变先撤再挂。空仓双边 ALO：点差≤2tick 贴买卖一，点差过宽则挂内侧（缝不超过 max(2tick, 3bp)）。有仓 reduce-only：<6s 远档 ALO，6–15s 中间 ALO，≥15s 撤后 IOC 吃单平仓。空仓同价挂 45s 无成交则重挂。ALO 价被拒则跟新盘口重挂。IOC 失败不停止。dead-man 20s 账户级，停止时清除。");
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", function () { render(); tick(); });
   else { render(); tick(); }
   setInterval(tick, POLL_MS);

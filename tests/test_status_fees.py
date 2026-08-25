@@ -34,9 +34,13 @@ def test_status_shows_tier4_both_coins_and_alo():
     assert "io:ANTH" in text and "io:SNDK" in text
     assert "xyz:SNDK" not in text
     assert "vntl:ANTHROPIC" not in text
-    assert "fee tier 4" in text
-    assert "all-in taker 0.0056%" in text
-    assert "maker 0.0000%" in text
+    assert "Entropy Partner T4" in text
+    assert "self rebate 200% of deployer share" in text
+    assert "gross taker 0.0056%" in text
+    assert "net 0.0000%" in text
+    assert "gross maker 0.0000%" in text
+    assert "HL volume tier 4" in text
     assert "default TIF=ALO" in text
     assert "growthMode=enabled" in text
     assert "isolated-only" in text
+    assert "优惠/referred-user benefit not applied to own fills" in text

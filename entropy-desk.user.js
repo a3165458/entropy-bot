@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Entropy Desk · ANTH / SNDK
 // @namespace    entropy-desk
-// @version      1.5.6
+// @version      1.5.7
 // @description  ALO-quote io:ANTH / io:SNDK; flatten reduce-only while in position
 // @match        https://entropy.io/*
 // @match        https://app.hyperliquid.xyz/*
@@ -759,21 +759,30 @@
   async function refreshAgentApproved() {
     var user = currentWallet() || state.wallet;
     var addr = state.agentAddress;
-    if (!user || !addr) {
-      state.agentApproved = false;
-      return false;
-    }
+    if (!user || !addr) return state.agentApproved;
     var extras = await fetchExtraAgents(user);
     if (extras == null) return state.agentApproved;
-    state.agentApproved = agentInExtras(extras, addr);
-    log("本地 agent " + addr + " extraAgents=" + (state.agentApproved ? "已批准" : "未批准") + " n=" + extras.length);
+    var found = agentInExtras(extras, addr);
+    if (found) {
+      state.agentApproved = true;
+      log("本地 agent " + addr + " extraAgents=已批准 n=" + extras.length);
+    } else {
+      state.agentApproved = true;
+      warn("extraAgents 未列出本地 agent " + addr + " n=" + extras.length + "，仍继续报价");
+    }
     return state.agentApproved;
   }
+  var agentNeedSiteShown = false;
   function requireApprovedAgent() {
-    if (state.agentApproved === false) {
-      setStatus(AGENT_NEED_SITE, true);
-      throw new Error(AGENT_NEED_SITE);
+    if (state.agentApproved === false) warn("extraAgents 未批准/未知，不阻断自动报价");
+  }
+  function showAgentNeedSiteOnce() {
+    if (agentNeedSiteShown) {
+      warn(AGENT_NEED_SITE);
+      return;
     }
+    agentNeedSiteShown = true;
+    setStatus(AGENT_NEED_SITE, true);
   }
   function exchangeSaysMissing(resp) {
     var blob = "";
@@ -812,12 +821,7 @@
     var w = makeLocalSigner(pk);
     state.agentWallet = w;
     state.agentAddress = w.address;
-    try {
-      await refreshAgentApproved();
-    } catch (eAp) {
-      warn("extraAgents", eAp && eAp.message);
-    }
-    if (state.agentApproved === false) setStatus(AGENT_NEED_SITE, true);
+    refreshAgentApproved().catch(function (eAp) { warn("extraAgents", eAp && eAp.message); });
     return w;
   }
   async function ensureWallet() {
@@ -947,14 +951,13 @@
   }
   async function sendSignedAction(action) {
     await loadLocalAgent();
-    if (state.agentApproved !== true) await refreshAgentApproved();
-    requireApprovedAgent();
+    refreshAgentApproved().catch(function (eR) { warn("extraAgents", eR && eR.message); });
     var nonce = nextNonce();
     var signed = await signL1(action, nonce);
     var resp = await postExchange(action, nonce, signed.signature);
     if (exchangeSaysMissing(resp)) {
       state.agentApproved = false;
-      setStatus(AGENT_NEED_SITE, true);
+      showAgentNeedSiteOnce();
       throw new Error(AGENT_NEED_SITE);
     }
     return resp;
@@ -1791,9 +1794,7 @@
     }
     if (autoOn(coin)) { updateAutoBits(); return; }
     loadLocalAgent().then(function () {
-      if (state.agentApproved !== true) return refreshAgentApproved();
-    }).then(function () {
-      requireApprovedAgent();
+      refreshAgentApproved().catch(function (eR) { warn("extraAgents", eR && eR.message); });
       state.autoCoins[coin] = true;
       state.lastQuoted[coin] = "";
       state.needsRequote[coin] = true;
@@ -1836,9 +1837,7 @@
     }
     if (!missing.length) { updateAutoBits(); return; }
     loadLocalAgent().then(function () {
-      if (state.agentApproved !== true) return refreshAgentApproved();
-    }).then(function () {
-      requireApprovedAgent();
+      refreshAgentApproved().catch(function (eR) { warn("extraAgents", eR && eR.message); });
       for (var k = 0; k < missing.length; k++) {
         state.autoCoins[missing[k]] = true;
         state.lastQuoted[missing[k]] = "";
@@ -2246,7 +2245,7 @@
   function buildPanelOnce(box) {
     if (box.getAttribute("data-ed-built") === "1") return;
     box.setAttribute("data-ed-built", "1");
-    box.appendChild(el("div", { class: "ed-top" }, [el("div", { class: "ed-title", text: "Entropy Desk · ANTH / SNDK  1.5.6" }), el("span", { class: "ed-muted", id: "ed-wallet", text: shortAddr(currentWallet()) })]));
+    box.appendChild(el("div", { class: "ed-top" }, [el("div", { class: "ed-title", text: "Entropy Desk · ANTH / SNDK  1.5.7" }), el("span", { class: "ed-muted", id: "ed-wallet", text: shortAddr(currentWallet()) })]));
     box.appendChild(el("div", { class: "ed-fees", text: "净手续费  taker ≈ 0   maker 0\nHL档4 0.028% × HIP-3×2 × growth×0.1 − Entropy自返200%×50%份额" }));
     var inp = el("input", { type: "number", min: "10", step: "1", value: String(state.notional), id: "ed-notional" });
     inp.addEventListener("change", function () { var v = Number(inp.value); if (v > 0) state.notional = v; });
@@ -2314,9 +2313,9 @@
       render();
     } finally { state.polling = false; }
   }
-  window.EntropyDesk = { version: "1.5.6", state: state, fee: FEE, refresh: tick, paperBoth: paperBoth, liveBoth: liveBoth, liveOrder: liveOrder, approveBuilder: approveBuilder, openTrade: openTrade, assertAllowedCoin: assertAllowedCoin, printFees: printFees, setAutoMm: setAutoMm, setAutoCoin: setAutoCoin, cancelCoinOrders: cancelCoinOrders, cancelAllDesk: cancelAllDesk, aloPrices: aloPrices };
+  window.EntropyDesk = { version: "1.5.7", state: state, fee: FEE, refresh: tick, paperBoth: paperBoth, liveBoth: liveBoth, liveOrder: liveOrder, approveBuilder: approveBuilder, openTrade: openTrade, assertAllowedCoin: assertAllowedCoin, printFees: printFees, setAutoMm: setAutoMm, setAutoCoin: setAutoCoin, cancelCoinOrders: cancelCoinOrders, cancelAllDesk: cancelAllDesk, aloPrices: aloPrices };
   printFees();
-  log("已加载 1.5.6。空仓双边 ALO，有仓只挂 reduce-only 平仓侧。盘口变动即改价。dead-man 20s 账户级，停止时清除。");
+  log("已加载 1.5.7。空仓双边 ALO，有仓只挂 reduce-only 平仓侧。盘口变动即改价。dead-man 20s 账户级，停止时清除。");
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", function () { render(); tick(); });
   else { render(); tick(); }
   setInterval(tick, POLL_MS);

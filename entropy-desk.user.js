@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Entropy Desk · ANTH / SNDK
 // @namespace    entropy-desk
-// @version      1.5.3
+// @version      1.5.4
 // @description  Watch and ALO-quote io:ANTH and io:SNDK on EntropyIO
 // @match        https://entropy.io/*
 // @match        https://app.hyperliquid.xyz/*
@@ -1241,7 +1241,7 @@
   }
   function modifyWire(oid, o) {
     return {
-      oid: oid | 0,
+      oid: asOid(oid),
       order: { a: o.a | 0, b: !!o.b, p: String(o.p), s: String(o.s), r: !!o.r, t: { limit: { tif: "Alo" } } }
     };
   }
@@ -1457,45 +1457,96 @@
       }
     }
   }
+  function asOid(x) {
+    var n = Number(x);
+    if (!Number.isFinite(n)) throw new Error("非法 oid: " + x);
+    n = Math.floor(n);
+    if (n < 0) throw new Error("非法 oid: " + x);
+    return n;
+  }
+  function tagCancelResp(resp, extra) {
+    var out = resp && typeof resp === "object" ? resp : { status: "ok" };
+    extra = extra || {};
+    var k;
+    for (k in extra) if (Object.prototype.hasOwnProperty.call(extra, k)) out[k] = extra[k];
+    return out;
+  }
+  async function safetyScheduleCancel(extra) {
+    extra = extra || {};
+    extra.rateLimited = true;
+    extra.empty = false;
+    try {
+      await sendDeadMan(Date.now() + 800);
+      extra.scheduled = true;
+      extra.status = extra.status || "ok";
+      return tagCancelResp({ status: "ok" }, extra);
+    } catch (eDm) {
+      warn("flatten scheduleCancel", eDm && eDm.message);
+      extra.scheduled = false;
+      extra.scheduleErr = String(eDm && eDm.message || eDm || "");
+      if (!extra.cancelledCache) {
+        throw new Error("info限流且定时撤失败，挂单可能仍在" + (extra.scheduleErr ? "：" + extra.scheduleErr : ""));
+      }
+      extra.status = extra.status || "ok";
+      return tagCancelResp({ status: "ok" }, extra);
+    }
+  }
   async function cancelOids(coin, oids) {
     if (!oids || !oids.length) return { status: "ok", skipped: true };
     var ast = state.assets[coin];
     if (!ast || ast.assetId == null) throw new Error("资产未解析: " + coin);
     var cancels = [];
-    for (var i = 0; i < oids.length; i++) cancels.push({ a: ast.assetId | 0, o: oids[i] | 0 });
+    for (var i = 0; i < oids.length; i++) cancels.push({ a: ast.assetId | 0, o: asOid(oids[i]) });
     var resp = await sendSignedAction(buildCancelAction(cancels));
-    log("撤单 " + coin + " n=" + oids.length + " " + JSON.stringify(resp));
+    log("撤单 " + coin + " n=" + oids.length + " oids=" + oids.map(asOid).join(",") + " " + JSON.stringify(resp));
     if (!actionOk(resp)) throw new Error("撤单失败 " + JSON.stringify(resp));
     return resp;
   }
   async function cancelAllForCoin(coin, wallet, opts) {
     coin = assertAllowedCoin(coin);
     opts = opts || {};
-    if (opts.refetch !== false && !state.assets[coin]) await resolveAssets();
+    var wantRefetch = opts.refetch !== false;
+    if (wantRefetch && !state.assets[coin]) await resolveAssets();
     var cached = listCachedOids(coin);
+    var cancelledCache = false;
+    var lastResp = null;
     if (cached.length) {
       if (!state.assets[coin] || state.assets[coin].assetId == null) {
-        if (opts.refetch === false) return { status: "ok", empty: true };
-        await resolveAssets();
+        try { await resolveAssets(); } catch (eRes) { warn("resolveAssets", eRes && eRes.message); }
       }
-      var respC = await cancelOids(coin, cached);
-      clearOids(coin);
-      return respC;
+      if (state.assets[coin] && state.assets[coin].assetId != null) {
+        lastResp = await cancelOids(coin, cached);
+        clearOids(coin);
+        cancelledCache = true;
+      }
     }
-    if (opts.refetch === false) return { status: "ok", empty: true };
-    var user = masterUser(wallet);
-    if (!user) return { status: "ok", empty: true };
-    var opens = await fetchOpenOrders(user);
-    if (!opens) return { status: "ok", empty: true };
-    applyOpenOrders(opens);
-    var oids = oidsForCoin(opens, coin);
-    if (!oids.length) {
-      clearOids(coin);
-      return { status: "ok", empty: true };
+    var user = "";
+    try { user = masterUser(wallet); } catch (eU) { user = ""; }
+    if (!user) {
+      if (cancelledCache) return tagCancelResp(lastResp, { cancelledCache: true, empty: false });
+      if (!wantRefetch) return safetyScheduleCancel({ cancelledCache: false, reason: "no-user" });
+      return { status: "ok", skipped: true, empty: false, reason: "no-user" };
     }
-    var resp = await cancelOids(coin, oids);
-    clearOids(coin);
-    return resp;
+    async function pullAndCancel(again) {
+      var opens = await fetchOpenOrders(user);
+      if (opens == null) {
+        return safetyScheduleCancel({ cancelledCache: cancelledCache });
+      }
+      applyOpenOrders(opens);
+      var oids = oidsForCoin(opens, coin);
+      if (!oids.length) {
+        clearOids(coin);
+        if (cancelledCache) return tagCancelResp(lastResp, { cancelledCache: true, empty: false, fetched: true });
+        return { status: "ok", empty: true, fetched: true };
+      }
+      lastResp = await cancelOids(coin, oids);
+      clearOids(coin);
+      cancelledCache = true;
+      if (again) return pullAndCancel(false);
+      return tagCancelResp(lastResp, { cancelledCache: true, empty: false, fetched: true });
+    }
+    if (!wantRefetch) return pullAndCancel(false);
+    return pullAndCancel(true);
   }
   async function sendDeadMan(timeMs) {
     var action = { type: "scheduleCancel" };
@@ -1515,7 +1566,8 @@
     try {
       coin = assertAllowedCoin(coin);
       var resp = await cancelAllForCoin(coin, currentWallet(), { refetch: true });
-      if (resp && resp.empty) setStatus(coin + " 没有挂单可撤", false);
+      if (resp && resp.rateLimited) setStatus("已撤缓存单号，info限流，已提交 0.8s 全撤", false);
+      else if (resp && resp.empty) setStatus(coin + " 没有挂单可撤", false);
       else setStatus("已撤 " + coin + " " + JSON.stringify(resp && resp.response ? resp.response : resp), resp && resp.status && resp.status !== "ok");
       return resp;
     } finally {
@@ -1532,8 +1584,15 @@
       var wallet = currentWallet();
       if (!wallet) throw new Error("没有钱包地址");
       if (!state.assets["io:ANTH"]) await resolveAssets();
-      for (var i = 0; i < ALLOWED.length; i++) await cancelAllForCoin(ALLOWED[i], wallet, { refetch: true });
-      setStatus("已全部撤单", false);
+      var anyLimited = false, allEmpty = true, lastDesk = null;
+      for (var i = 0; i < ALLOWED.length; i++) {
+        lastDesk = await cancelAllForCoin(ALLOWED[i], wallet, { refetch: true });
+        if (lastDesk && lastDesk.rateLimited) anyLimited = true;
+        if (!(lastDesk && lastDesk.empty)) allEmpty = false;
+      }
+      if (anyLimited) setStatus("已撤缓存单号，info限流，已提交 0.8s 全撤", false);
+      else if (allEmpty) setStatus("没有挂单可撤", false);
+      else setStatus("已全部撤单", false);
     } finally {
       state.inFlight = false;
       setLiveBusy(false);
@@ -1542,16 +1601,25 @@
   async function clearDeadManAndCancelAll(coins) {
     var list = coins || ALLOWED;
     var wallet = currentWallet();
+    var anyLimited = false;
+    var anyOk = false;
     for (var i = 0; i < list.length; i++) {
       state.needsRequote[list[i]] = false;
-      try { await cancelAllForCoin(list[i], wallet, { refetch: false }); }
-      catch (eC) { warn("停止撤单", list[i], eC && eC.message); }
+      try {
+        var r = await cancelAllForCoin(list[i], wallet, { refetch: true });
+        if (r && r.rateLimited) anyLimited = true;
+        if (r && (r.scheduled || r.fetched || r.cancelledCache || r.empty || actionOk(r))) anyOk = true;
+      } catch (eC) { warn("停止撤单", list[i], eC && eC.message); }
     }
+    var scheduled = false;
     try {
       await sendDeadMan(Date.now() + 800);
+      scheduled = true;
     } catch (eDm) {
       warn("flatten scheduleCancel", eDm && eDm.message);
     }
+    if (!anyOk && !scheduled) throw new Error("停止撤单失败：info限流且定时撤失败，挂单可能仍在");
+    return { status: "ok", rateLimited: anyLimited, scheduled: scheduled, empty: false };
   }
   function stopAutoMm(msg, isErr) {
     var wasOn = [];
@@ -1571,13 +1639,13 @@
     }
     Promise.resolve().then(function () {
       return clearDeadManAndCancelAll(wasOn);
-    }).then(function () {
-      var out = "已停止并撤单";
+    }).then(function (resp) {
+      var out = (resp && resp.rateLimited) ? "已撤缓存单号，info限流，已提交 0.8s 全撤" : "已停止并撤单";
       if (isErr && msg) out += "：" + msg;
       setStatus(out, !!isErr);
     }).catch(function (eS) {
       var em = String(eS && eS.message || eS || "");
-      if (/429/.test(em)) setStatus("已停止并撤单（info限流，已按缓存/定时撤）", false);
+      if (/429/.test(em) || /限流/.test(em)) setStatus("已撤缓存单号，info限流，已提交 0.8s 全撤", false);
       else setStatus("停止撤单失败: " + em, true);
     });
   }
@@ -1593,18 +1661,20 @@
       if (!was) return;
       var last = !state.autoMm;
       Promise.resolve().then(function () {
-        return cancelAllForCoin(coin, currentWallet(), { refetch: false });
-      }).then(function () {
+        return cancelAllForCoin(coin, currentWallet(), { refetch: true });
+      }).then(function (resp) {
         if (last) {
           return sendDeadMan(Date.now() + 800).catch(function (eDm) {
             warn("flatten scheduleCancel", eDm && eDm.message);
-          });
+          }).then(function () { return resp; });
         }
-      }).then(function () {
-        setStatus(coin + " 已停止并撤单", false);
+        return resp;
+      }).then(function (resp) {
+        if (resp && resp.rateLimited) setStatus(coin + " 已撤缓存单号，info限流，已提交 0.8s 全撤", false);
+        else setStatus(coin + " 已停止并撤单", false);
       }).catch(function (eS) {
         var em = String(eS && eS.message || eS || "");
-        if (/429/.test(em)) setStatus(coin + " 已停止并撤单（info限流，已按缓存/定时撤）", false);
+        if (/429/.test(em) || /限流/.test(em)) setStatus(coin + " 已撤缓存单号，info限流，已提交 0.8s 全撤", false);
         else setStatus("停止撤单失败: " + em, true);
       });
       return;
@@ -1631,7 +1701,7 @@
       setStatus(String(eA.message || eA), true);
       if (started) {
         var lastOff = !state.autoMm;
-        cancelAllForCoin(coin, currentWallet(), { refetch: false }).then(function () {
+        cancelAllForCoin(coin, currentWallet(), { refetch: true }).then(function () {
           if (lastOff) return sendDeadMan(Date.now() + 800);
         }).catch(function (eC) { warn("开启失败撤单", eC && eC.message); });
       }
@@ -2035,7 +2105,7 @@
   function buildPanelOnce(box) {
     if (box.getAttribute("data-ed-built") === "1") return;
     box.setAttribute("data-ed-built", "1");
-    box.appendChild(el("div", { class: "ed-top" }, [el("div", { class: "ed-title", text: "Entropy Desk · ANTH / SNDK  1.5.3" }), el("span", { class: "ed-muted", id: "ed-wallet", text: shortAddr(currentWallet()) })]));
+    box.appendChild(el("div", { class: "ed-top" }, [el("div", { class: "ed-title", text: "Entropy Desk · ANTH / SNDK  1.5.4" }), el("span", { class: "ed-muted", id: "ed-wallet", text: shortAddr(currentWallet()) })]));
     box.appendChild(el("div", { class: "ed-fees", text: "净手续费  taker ≈ 0   maker 0\nHL档4 0.028% × HIP-3×2 × growth×0.1 − Entropy自返200%×50%份额" }));
     var inp = el("input", { type: "number", min: "10", step: "1", value: String(state.notional), id: "ed-notional" });
     inp.addEventListener("change", function () { var v = Number(inp.value); if (v > 0) state.notional = v; });
@@ -2102,9 +2172,9 @@
       render();
     } finally { state.polling = false; }
   }
-  window.EntropyDesk = { version: "1.5.3", state: state, fee: FEE, refresh: tick, paperBoth: paperBoth, liveBoth: liveBoth, liveOrder: liveOrder, approveBuilder: approveBuilder, openTrade: openTrade, assertAllowedCoin: assertAllowedCoin, printFees: printFees, setAutoMm: setAutoMm, setAutoCoin: setAutoCoin, cancelCoinOrders: cancelCoinOrders, cancelAllDesk: cancelAllDesk, aloPrices: aloPrices };
+  window.EntropyDesk = { version: "1.5.4", state: state, fee: FEE, refresh: tick, paperBoth: paperBoth, liveBoth: liveBoth, liveOrder: liveOrder, approveBuilder: approveBuilder, openTrade: openTrade, assertAllowedCoin: assertAllowedCoin, printFees: printFees, setAutoMm: setAutoMm, setAutoCoin: setAutoCoin, cancelCoinOrders: cancelCoinOrders, cancelAllDesk: cancelAllDesk, aloPrices: aloPrices };
   printFees();
-  log("已加载 1.5.3。每个币单独勾选自动紧贴。盘口变动即改价，撤单不排队确认。dead-man 20s。");
+  log("已加载 1.5.4。每个币单独勾选自动紧贴。盘口变动即改价，撤单不排队确认。dead-man 20s。");
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", function () { render(); tick(); });
   else { render(); tick(); }
   setInterval(tick, POLL_MS);

@@ -57,6 +57,10 @@ def test_paper_does_not_require_key(monkeypatch):
     assert settings.fee_tier == 4
     assert settings.referral_discount == 0.0
     assert settings.maker_rebate_bps is None
+    assert settings.entropy_tier == 4
+    assert settings.entropy_self_rebate == 2.0
+    assert settings.entropy_referral_reward == 1.0
+    assert settings.entropy_referred_user_benefit == 0.0
 
 
 def test_fee_env_optional_layers(monkeypatch):
@@ -66,11 +70,19 @@ def test_fee_env_optional_layers(monkeypatch):
     monkeypatch.setenv("FEE_TIER", "4")
     monkeypatch.setenv("REFERRAL_DISCOUNT", "0.04")
     monkeypatch.setenv("MAKER_REBATE_BPS", "0.3")
+    monkeypatch.setenv("ENTROPY_TIER", "4")
+    monkeypatch.setenv("ENTROPY_SELF_REBATE", "2.0")
+    monkeypatch.setenv("ENTROPY_REFERRAL_REWARD", "1.0")
+    monkeypatch.setenv("ENTROPY_REFERRED_USER_BENEFIT", "0")
     settings = load_settings()
     assert settings.fee_tier == 4
     assert settings.referral_discount == 0.04
     assert settings.maker_rebate_bps == 0.3
     assert settings.coins == ("io:ANTH", "io:SNDK")
+    assert settings.entropy_tier == 4
+    assert settings.entropy_self_rebate == 2.0
+    assert settings.entropy_referral_reward == 1.0
+    assert settings.entropy_referred_user_benefit == 0.0
 
 
 def test_env_rejects_xyz_coins(monkeypatch):

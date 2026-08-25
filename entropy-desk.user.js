@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Entropy Desk · ANTH / SNDK
 // @namespace    entropy-desk
-// @version      1.5.5
+// @version      1.5.6
 // @description  ALO-quote io:ANTH / io:SNDK; flatten reduce-only while in position
 // @match        https://entropy.io/*
 // @match        https://app.hyperliquid.xyz/*
@@ -1045,14 +1045,14 @@
       if (!user) return null;
       async function query(u) {
         try {
-          var r = await hlInfo({ type: "frontendOpenOrders", user: u });
+          var r = await hlInfo({ type: "frontendOpenOrders", user: u, dex: DEX });
           if (Array.isArray(r)) return r;
           if (r == null) throw new Error("frontendOpenOrders 空/限流");
         } catch (eFo) {
           warn("frontendOpenOrders 失败，回退 openOrders", eFo && eFo.message);
         }
         try {
-          var r2 = await hlInfo({ type: "openOrders", user: u });
+          var r2 = await hlInfo({ type: "openOrders", user: u, dex: DEX });
           if (Array.isArray(r2)) return r2;
           if (r2 == null) return null;
           return [];
@@ -1446,7 +1446,7 @@
     };
   }
   async function maybeDeadMan() {
-    if (!state.autoMm) return;
+    if (!anyAutoCoin()) return;
     var t = nowMs();
     if (state.lastDeadMan && t - state.lastDeadMan < 8000) return;
     state.lastDeadMan = t;
@@ -1580,7 +1580,7 @@
     extra.rateLimited = true;
     extra.empty = false;
     try {
-      await sendDeadMan(Date.now() + 800);
+      await sendDeadMan(Date.now() + 6000);
       extra.scheduled = true;
       extra.status = extra.status || "ok";
       return tagCancelResp({ status: "ok" }, extra);
@@ -1654,9 +1654,13 @@
   }
   async function sendDeadMan(timeMs) {
     var action = { type: "scheduleCancel" };
-    if (timeMs != null) action.time = Math.floor(Number(timeMs));
+    if (timeMs != null) {
+      var t = Math.floor(Number(timeMs));
+      if (!(t - Date.now() >= 5000)) t = Date.now() + 6000;
+      action.time = Math.floor(t);
+    }
     var resp = await sendSignedAction(action);
-    log(timeMs != null ? "dead-man scheduleCancel +" + Math.round((timeMs - Date.now()) / 1000) + "s" : "dead-man scheduleCancel 已清除");
+    log(timeMs != null ? "dead-man scheduleCancel +" + Math.round((action.time - Date.now()) / 1000) + "s 账户级" : "dead-man scheduleCancel 已清除");
     return resp;
   }
   async function cancelThenAlo(coin, q) {
@@ -1670,7 +1674,7 @@
     try {
       coin = assertAllowedCoin(coin);
       var resp = await cancelAllForCoin(coin, currentWallet(), { refetch: true });
-      if (resp && resp.rateLimited) setStatus("已撤缓存单号，info限流，已提交 0.8s 全撤", false);
+      if (resp && resp.rateLimited) setStatus("已撤缓存单号，info限流，已提交 6s 账户级定时撤（所有市场）", false);
       else if (resp && resp.empty) setStatus(coin + " 没有挂单可撤", false);
       else setStatus("已撤 " + coin + " " + JSON.stringify(resp && resp.response ? resp.response : resp), resp && resp.status && resp.status !== "ok");
       return resp;
@@ -1694,7 +1698,7 @@
         if (lastDesk && lastDesk.rateLimited) anyLimited = true;
         if (!(lastDesk && lastDesk.empty)) allEmpty = false;
       }
-      if (anyLimited) setStatus("已撤缓存单号，info限流，已提交 0.8s 全撤", false);
+      if (anyLimited) setStatus("已撤缓存单号，info限流，已提交 6s 账户级定时撤（所有市场）", false);
       else if (allEmpty) setStatus("没有挂单可撤", false);
       else setStatus("已全部撤单", false);
     } finally {
@@ -1717,7 +1721,8 @@
     }
     var scheduled = false;
     try {
-      await sendDeadMan(Date.now() + 800);
+      if (anyLimited) await sendDeadMan(Date.now() + 6000);
+      else await sendDeadMan();
       scheduled = true;
     } catch (eDm) {
       warn("flatten scheduleCancel", eDm && eDm.message);
@@ -1744,12 +1749,12 @@
     Promise.resolve().then(function () {
       return clearDeadManAndCancelAll(wasOn);
     }).then(function (resp) {
-      var out = (resp && resp.rateLimited) ? "已撤缓存单号，info限流，已提交 0.8s 全撤" : "已停止并撤单";
+      var out = (resp && resp.rateLimited) ? "已撤缓存单号，info限流，已提交 6s 账户级定时撤（所有市场）" : "已停止并撤单";
       if (isErr && msg) out += "：" + msg;
       setStatus(out, !!isErr);
     }).catch(function (eS) {
       var em = String(eS && eS.message || eS || "");
-      if (/429/.test(em) || /限流/.test(em)) setStatus("已撤缓存单号，info限流，已提交 0.8s 全撤", false);
+      if (/429/.test(em) || /限流/.test(em)) setStatus("已撤缓存单号，info限流，已提交 6s 账户级定时撤（所有市场）", false);
       else setStatus("停止撤单失败: " + em, true);
     });
   }
@@ -1768,17 +1773,18 @@
         return cancelAllForCoin(coin, currentWallet(), { refetch: true });
       }).then(function (resp) {
         if (last) {
-          return sendDeadMan(Date.now() + 800).catch(function (eDm) {
+          var dm = (resp && resp.rateLimited) ? sendDeadMan(Date.now() + 6000) : sendDeadMan();
+          return dm.catch(function (eDm) {
             warn("flatten scheduleCancel", eDm && eDm.message);
           }).then(function () { return resp; });
         }
         return resp;
       }).then(function (resp) {
-        if (resp && resp.rateLimited) setStatus(coin + " 已撤缓存单号，info限流，已提交 0.8s 全撤", false);
+        if (resp && resp.rateLimited) setStatus(coin + " 已撤缓存单号，info限流，已提交 6s 账户级定时撤（所有市场）", false);
         else setStatus(coin + " 已停止并撤单", false);
       }).catch(function (eS) {
         var em = String(eS && eS.message || eS || "");
-        if (/429/.test(em) || /限流/.test(em)) setStatus(coin + " 已撤缓存单号，info限流，已提交 0.8s 全撤", false);
+        if (/429/.test(em) || /限流/.test(em)) setStatus(coin + " 已撤缓存单号，info限流，已提交 6s 账户级定时撤（所有市场）", false);
         else setStatus("停止撤单失败: " + em, true);
       });
       return;
@@ -1805,8 +1811,10 @@
       setStatus(String(eA.message || eA), true);
       if (started) {
         var lastOff = !state.autoMm;
-        cancelAllForCoin(coin, currentWallet(), { refetch: true }).then(function () {
-          if (lastOff) return sendDeadMan(Date.now() + 800);
+        cancelAllForCoin(coin, currentWallet(), { refetch: true }).then(function (rOff) {
+          if (!lastOff) return;
+          if (rOff && rOff.rateLimited) return sendDeadMan(Date.now() + 6000);
+          return sendDeadMan();
         }).catch(function (eC) { warn("开启失败撤单", eC && eC.message); });
       }
     });
@@ -2027,17 +2035,22 @@
       if (!q || q.assetId == null) throw new Error("资产未解析: " + coin);
       var wallet = currentWallet();
       if (!wallet) throw new Error("没有钱包地址");
-      await cancelAllForCoin(coin, wallet, { refetch: false });
+      await refreshPositions(true);
       var px = aloPrices(q);
+      var plan = flattenPlan(coin, q, px);
+      if (isBuy && !plan.wantBuy) throw new Error(coin + " 已有多仓，只允许 reduce-only 卖平");
+      if (!isBuy && !plan.wantSell) throw new Error(coin + " 已有空仓，只允许 reduce-only 买平");
+      await cancelAllForCoin(coin, wallet, { refetch: false });
       var p = isBuy ? px.buy : px.sell;
-      var s = sizeFromNotional(p, q.szDecimals, state.notional);
-      var action = buildOrderAction([{ a: q.assetId, b: !!isBuy, p: p, s: s, r: false }]);
-      log("实盘签名", coin, isBuy ? "买" : "卖", s, "@", p, "asset", q.assetId);
+      var sz = isBuy ? plan.buySz : plan.sellSz;
+      var rOnly = isBuy ? !!plan.buyR : !!plan.sellR;
+      var action = buildOrderAction([{ a: q.assetId, b: !!isBuy, p: p, s: sz, r: rOnly }]);
+      log("实盘签名", coin, isBuy ? "买" : "卖", sz, "@", p, rOnly ? "ro" : "alo", "asset", q.assetId);
       var resp = await sendSignedAction(action);
       if (!actionOk(resp)) throw new Error("下单失败 " + JSON.stringify(resp));
-      ingestOrderStatuses(coin, [{ a: q.assetId, b: !!isBuy, p: p, s: s, r: false }], resp);
+      ingestOrderStatuses(coin, [{ a: q.assetId, b: !!isBuy, p: p, s: sz, r: rOnly }], resp);
       log("实盘回报 " + JSON.stringify(resp));
-      setStatus("实盘 " + coin + " " + (isBuy ? "买" : "卖") + " " + JSON.stringify(resp && resp.response ? resp.response : resp), false);
+      setStatus("实盘 " + flattenStatusBit(coin) + " " + (isBuy ? "买" : "卖") + (rOnly ? " ro" : "") + " " + JSON.stringify(resp && resp.response ? resp.response : resp), false);
       render();
       return resp;
     } finally {
@@ -2233,7 +2246,7 @@
   function buildPanelOnce(box) {
     if (box.getAttribute("data-ed-built") === "1") return;
     box.setAttribute("data-ed-built", "1");
-    box.appendChild(el("div", { class: "ed-top" }, [el("div", { class: "ed-title", text: "Entropy Desk · ANTH / SNDK  1.5.5" }), el("span", { class: "ed-muted", id: "ed-wallet", text: shortAddr(currentWallet()) })]));
+    box.appendChild(el("div", { class: "ed-top" }, [el("div", { class: "ed-title", text: "Entropy Desk · ANTH / SNDK  1.5.6" }), el("span", { class: "ed-muted", id: "ed-wallet", text: shortAddr(currentWallet()) })]));
     box.appendChild(el("div", { class: "ed-fees", text: "净手续费  taker ≈ 0   maker 0\nHL档4 0.028% × HIP-3×2 × growth×0.1 − Entropy自返200%×50%份额" }));
     var inp = el("input", { type: "number", min: "10", step: "1", value: String(state.notional), id: "ed-notional" });
     inp.addEventListener("change", function () { var v = Number(inp.value); if (v > 0) state.notional = v; });
@@ -2252,6 +2265,7 @@
     autoLab.appendChild(document.createTextNode(" 全部自动紧贴"));
     box.appendChild(el("div", { class: "ed-row" }, [autoLab]));
     box.appendChild(el("div", { class: "ed-muted", id: "ed-automm-help", text: "空仓双边；有仓只挂 reduce-only 平仓侧" }));
+    box.appendChild(el("div", { class: "ed-muted", id: "ed-deadman-note", text: "定时撤是账户级，会动到其它市场手单" }));
     box.appendChild(el("div", { class: "ed-muted", id: "ed-mode", text: "自动紧贴：空仓双边，有仓只挂平仓侧" }));
     ALLOWED.forEach(function (c) { box.appendChild(buildCoinCard(c)); });
     var extra = el("div", { class: "ed-row" });
@@ -2300,9 +2314,9 @@
       render();
     } finally { state.polling = false; }
   }
-  window.EntropyDesk = { version: "1.5.5", state: state, fee: FEE, refresh: tick, paperBoth: paperBoth, liveBoth: liveBoth, liveOrder: liveOrder, approveBuilder: approveBuilder, openTrade: openTrade, assertAllowedCoin: assertAllowedCoin, printFees: printFees, setAutoMm: setAutoMm, setAutoCoin: setAutoCoin, cancelCoinOrders: cancelCoinOrders, cancelAllDesk: cancelAllDesk, aloPrices: aloPrices };
+  window.EntropyDesk = { version: "1.5.6", state: state, fee: FEE, refresh: tick, paperBoth: paperBoth, liveBoth: liveBoth, liveOrder: liveOrder, approveBuilder: approveBuilder, openTrade: openTrade, assertAllowedCoin: assertAllowedCoin, printFees: printFees, setAutoMm: setAutoMm, setAutoCoin: setAutoCoin, cancelCoinOrders: cancelCoinOrders, cancelAllDesk: cancelAllDesk, aloPrices: aloPrices };
   printFees();
-  log("已加载 1.5.5。空仓双边 ALO，有仓只挂 reduce-only 平仓侧。盘口变动即改价。dead-man 20s。");
+  log("已加载 1.5.6。空仓双边 ALO，有仓只挂 reduce-only 平仓侧。盘口变动即改价。dead-man 20s 账户级，停止时清除。");
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", function () { render(); tick(); });
   else { render(); tick(); }
   setInterval(tick, POLL_MS);

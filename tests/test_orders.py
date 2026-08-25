@@ -8,10 +8,15 @@ from entropy_bot.coins import CoinError, contains_foreign_venue
 from entropy_bot.errors import LiveGuardError
 from entropy_bot.orders import (
     DEFAULT_TIF,
+    ENTROPY_BUILDER,
     LiveSigner,
     alo_order_action,
     alo_order_wire,
+    as_oid,
     make_cloid,
+    order_action,
+    order_wire,
+    sign_and_wrap,
     update_leverage_action,
 )
 from entropy_bot.quoting import book_top, desired_quotes
@@ -93,6 +98,77 @@ def test_quotes_never_emit_xyz(markets):
 def test_live_signer_refuses_empty_key():
     with pytest.raises(LiveGuardError):
         LiveSigner("")
+
+
+def test_order_action_includes_entropy_builder(markets):
+    anth = markets["io:ANTH"]
+    wire = alo_order_wire(
+        asset_id=anth.asset_id,
+        is_buy=True,
+        limit_px=1979.2,
+        sz=0.025,
+        cloid=make_cloid("io:ANTH", "B", 1),
+    )
+    action = alo_order_action([wire])
+    assert action["builder"] == {"b": ENTROPY_BUILDER.lower(), "f": 0}
+
+
+def test_ioc_allowed_only_for_reduce_only_flatten(markets):
+    anth = markets["io:ANTH"]
+    ioc = order_wire(
+        asset_id=anth.asset_id,
+        is_buy=False,
+        limit_px=1985.0,
+        sz=0.02,
+        reduce_only=True,
+        tif="Ioc",
+    )
+    assert ioc["t"] == {"limit": {"tif": "Ioc"}}
+    assert ioc["r"] is True
+    action = order_action([ioc])
+    assert action["orders"][0]["t"]["limit"]["tif"] == "Ioc"
+    with pytest.raises(ValueError, match="reduce-only"):
+        order_wire(
+            asset_id=anth.asset_id,
+            is_buy=True,
+            limit_px=1985.0,
+            sz=0.02,
+            reduce_only=False,
+            tif="Ioc",
+        )
+
+
+def test_oid_not_truncated_to_int32():
+    big = 5_000_000_000  # > uint32; `| 0` / int32 would wrap
+    assert as_oid(big) == big
+    assert as_oid(str(big)) == big
+    assert as_oid(big) != (big & 0xFFFFFFFF)
+    with pytest.raises(ValueError):
+        as_oid(-1)
+
+
+def test_agent_signing_does_not_put_master_in_vault(markets):
+    agent_key = "0x" + "ab" * 32
+    master = "0x" + "11" * 20
+    signer = LiveSigner(agent_key, master)
+    assert signer.is_agent is True
+    assert signer.account.lower() == master.lower()
+    assert signer.wallet.address.lower() != master.lower()
+    payload = signer.signed_update_leverage(markets["io:ANTH"], 2)
+    assert "vaultAddress" not in payload
+    from hyperliquid.utils.signing import recover_agent_or_user_from_l1_action
+
+    recovered = recover_agent_or_user_from_l1_action(
+        payload["action"],
+        payload["signature"],
+        None,
+        payload["nonce"],
+        None,
+        True,
+    )
+    assert recovered.lower() == signer.signer_address.lower()
+    wrapped = sign_and_wrap(signer.wallet, payload["action"], vault_address=None)
+    assert "vaultAddress" not in wrapped
 
 
 def test_resolve_uses_mocked_meta_not_hardcoded_xyz():

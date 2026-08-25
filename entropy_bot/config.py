@@ -21,7 +21,6 @@ from entropy_bot.fees import (
 DEFAULT_API_URL = "https://api.hyperliquid.xyz"
 DEFAULT_WS_URL = "wss://api.hyperliquid.xyz/ws"
 DEFAULT_NOTIONAL = 50.0
-DEFAULT_LIVE_NOTIONAL = 15.0
 DEFAULT_OFFSET_TICKS = 2
 DEFAULT_MAX_LEVERAGE = 2
 MIN_ORDER_USD = 10.0
@@ -134,5 +133,5 @@ def require_signer(settings: Settings) -> None:
 
 
 def live_notional(settings: Settings) -> float:
-    """Keep live quotes tiny: min configured notional vs the live default, >= $10."""
-    return max(MIN_ORDER_USD, min(settings.quote_notional_usd, DEFAULT_LIVE_NOTIONAL))
+    """Default ~$50/side, never below the $10 exchange minimum."""
+    return max(MIN_ORDER_USD, settings.quote_notional_usd)

@@ -12,3 +12,7 @@ class LiveGuardError(EntropyBotError):
 
 class ConfigError(EntropyBotError):
     """Invalid configuration."""
+
+
+class RateLimited(EntropyBotError):
+    """Official API returned 429 or an empty rate-limit body."""

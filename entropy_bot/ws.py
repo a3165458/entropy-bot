@@ -23,6 +23,9 @@ class BookFeed:
         self.coins = tuple(assert_tradable(c) for c in coins)
         self.on_book = on_book
         self.books: dict[str, dict[str, Any]] = {}
+        self.book_ts: dict[str, float] = {}
+        self.last_msg_ts: float = 0.0
+        self._lock = threading.Lock()
         self._stop = threading.Event()
         self._ready = threading.Event()
         self._ws: websocket.WebSocketApp | None = None
@@ -44,6 +47,19 @@ class BookFeed:
 
     def wait_ready(self, timeout: float = 15.0) -> bool:
         return self._ready.wait(timeout)
+
+    def is_fresh(self, max_age: float = 15.0) -> bool:
+        with self._lock:
+            ts = self.last_msg_ts
+        return ts > 0 and (time.time() - ts) < max_age
+
+    def latest(self, coin: str) -> tuple[float, dict[str, Any]] | None:
+        with self._lock:
+            data = self.books.get(coin)
+            ts = self.book_ts.get(coin, 0.0)
+        if data is None:
+            return None
+        return ts, data
 
     def stop(self) -> None:
         self._stop.set()
@@ -81,6 +97,9 @@ class BookFeed:
             payload = json.loads(message)
         except json.JSONDecodeError:
             return
+        now = time.time()
+        with self._lock:
+            self.last_msg_ts = now
         if payload.get("channel") == "pong":
             return
         if payload.get("channel") != "l2Book":
@@ -93,7 +112,9 @@ class BookFeed:
             coin = assert_tradable(coin)
         except Exception:
             return
-        self.books[coin] = data
+        with self._lock:
+            self.books[coin] = data
+            self.book_ts[coin] = now
         self.on_book(coin, data)
 
     def _on_error(self, _ws: websocket.WebSocketApp, error: Any) -> None:

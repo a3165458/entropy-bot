@@ -17,7 +17,10 @@ def run_cancel(settings: Settings) -> int:
     client = InfoClient(settings.api_url)
     try:
         _meta, markets, _ctxs = load_io_markets(client, settings.coins)
-        orders = client.open_orders(signer.account, ALLOWED_DEX)
+        orders = client.open_orders(signer.account, ALLOWED_DEX, optional=True)
+        if orders is None:
+            log.error("frontendOpenOrders null/429; not assuming the book is empty")
+            return 2
         pairs: list[tuple[int, str]] = []
         for order in orders:
             coin = order.get("coin")

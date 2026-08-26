@@ -7,7 +7,7 @@ Sizes: rounded to szDecimals.
 
 from __future__ import annotations
 
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_CEILING, ROUND_DOWN
 
 MAX_DECIMALS_PERP = 6
 SIG_FIGS = 5
@@ -82,3 +82,61 @@ def spread_bps(bid: float, ask: float) -> float | None:
 def isolated_leverage(requested: int, market_max: int) -> int:
     cap = min(int(requested), int(market_max))
     return max(1, cap)
+
+
+def tick_from_wire(px: object) -> float | None:
+    """Infer a tick from a live book price string (trailing zeros ignored)."""
+    if px is None:
+        return None
+    text = str(px).strip()
+    if not text:
+        return None
+    if "." not in text:
+        return 1.0
+    frac = text.split(".", 1)[1].rstrip("0")
+    return float(Decimal(10) ** -len(frac))
+
+
+def floor_to_tick(price: float, tick: float) -> float:
+    if tick <= 0:
+        raise ValueError("tick must be positive")
+    p = Decimal(str(price))
+    t = Decimal(str(tick))
+    steps = (p / t + Decimal("1e-8")).to_integral_value(rounding=ROUND_DOWN)
+    return float(steps * t)
+
+
+def ceil_to_tick(price: float, tick: float) -> float:
+    if tick <= 0:
+        raise ValueError("tick must be positive")
+    p = Decimal(str(price))
+    t = Decimal(str(tick))
+    steps = (p / t - Decimal("1e-8")).to_integral_value(rounding=ROUND_CEILING)
+    return float(steps * t)
+
+
+def book_tick(
+    bid: float | None,
+    ask: float | None,
+    sz_decimals: int,
+    *,
+    bid_px: str | None = None,
+    ask_px: str | None = None,
+    mid: float | None = None,
+) -> float:
+    """Live bid/ask increment, not tick_size(mid) (which is 1.0 near ANTH ~1985)."""
+    ticks: list[float] = []
+    for raw in (bid_px, ask_px):
+        inferred = tick_from_wire(raw)
+        if inferred is not None and inferred > 0:
+            ticks.append(inferred)
+    if bid is not None and bid > 0:
+        ticks.append(tick_size(bid, sz_decimals))
+    if ask is not None and ask > 0:
+        ticks.append(tick_size(ask, sz_decimals))
+    if ticks:
+        return min(ticks)
+    src = mid if mid and mid > 0 else bid if bid and bid > 0 else ask
+    if src is None or src <= 0:
+        return 10 ** -max_price_decimals(sz_decimals)
+    return tick_size(src, sz_decimals)

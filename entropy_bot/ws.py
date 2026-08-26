@@ -15,13 +15,23 @@ from entropy_bot.coins import assert_no_foreign_venue, assert_tradable
 log = logging.getLogger("entropy_bot.ws")
 
 BookCallback = Callable[[str, dict[str, Any]], None]
+UserFillsCallback = Callable[[dict[str, Any]], None]
 
 
 class BookFeed:
-    def __init__(self, ws_url: str, coins: tuple[str, ...], on_book: BookCallback) -> None:
+    def __init__(
+        self,
+        ws_url: str,
+        coins: tuple[str, ...],
+        on_book: BookCallback,
+        user: str | None = None,
+        on_user_fills: UserFillsCallback | None = None,
+    ) -> None:
         self.ws_url = ws_url
         self.coins = tuple(assert_tradable(c) for c in coins)
         self.on_book = on_book
+        self.user = user
+        self.on_user_fills = on_user_fills
         self.books: dict[str, dict[str, Any]] = {}
         self.book_ts: dict[str, float] = {}
         self.last_msg_ts: float = 0.0
@@ -88,6 +98,17 @@ class BookFeed:
             assert_no_foreign_venue(sub)
             ws.send(json.dumps(sub))
             log.info("subscribed l2Book %s", coin)
+        if self.user and self.on_user_fills is not None:
+            # Observe-only. l2Book subscribe above is unchanged.
+            ws.send(
+                json.dumps(
+                    {
+                        "method": "subscribe",
+                        "subscription": {"type": "userFills", "user": self.user},
+                    }
+                )
+            )
+            log.info("subscribed userFills observe-only")
         self._ready.set()
 
     def _on_message(self, _ws: websocket.WebSocketApp, message: str) -> None:
@@ -101,6 +122,14 @@ class BookFeed:
         with self._lock:
             self.last_msg_ts = now
         if payload.get("channel") == "pong":
+            return
+        if payload.get("channel") == "userFills":
+            data = payload.get("data") or {}
+            if isinstance(data, dict) and self.on_user_fills is not None:
+                try:
+                    self.on_user_fills(data)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("userFills callback: %s", exc)
             return
         if payload.get("channel") != "l2Book":
             return

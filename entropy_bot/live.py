@@ -44,6 +44,7 @@ from entropy_bot.quoting import (
     quote_plan,
     sync_pos_since,
 )
+from entropy_bot.diagnostics import BookSnap, FillDiagnostics, snap_from_top
 from entropy_bot.errors import RateLimited
 from entropy_bot.rest import InfoClient
 from entropy_bot.status import load_io_markets
@@ -53,6 +54,7 @@ log = logging.getLogger("entropy_bot.live")
 
 WS_STALE_S = 15.0
 POS_POLL_S = 0.8
+FILL_POLL_S = 2.0
 LOOP_S = 0.4
 DEADMAN_AHEAD_MS = 20_000
 DEADMAN_MIN_MS = 5_000
@@ -244,9 +246,12 @@ class LiveQuoter:
     quote_placed_at: dict[str, float] = field(default_factory=dict)
     last_take_at: dict[str, float] = field(default_factory=dict)
     last_pos_poll: float = 0.0
+    last_fill_poll: float = 0.0
     last_deadman: float = 0.0
     _lock: threading.Lock = field(default_factory=threading.Lock)
     books: dict[str, tuple[float, dict[str, Any]]] = field(default_factory=dict)
+    diag: FillDiagnostics | None = None
+    _feed: BookFeed | None = None
 
     def __post_init__(self) -> None:
         if not self.notional:
@@ -260,10 +265,71 @@ class LiveQuoter:
             self.pos = {coin: 0.0 for coin in coins}
         if not self.pos_since:
             self.pos_since = {coin: 0.0 for coin in coins}
+        if self.diag is None:
+            self.diag = FillDiagnostics(coins)
 
     def on_book(self, coin: str, data: dict[str, Any]) -> None:
         with self._lock:
             self.books[coin] = (time.time(), data)
+
+    def peek_book(self, coin: str) -> BookSnap | None:
+        """Cache/WS l2Book only. Diagnostics must not open a WS or REST-fallback."""
+        now = time.time()
+        ts = 0.0
+        data: dict[str, Any] | None = None
+        with self._lock:
+            if coin in self.books:
+                ts, data = self.books[coin]
+        feed = self._feed
+        if feed is not None:
+            latest = feed.latest(coin)
+            if latest is not None:
+                ts, data = latest
+        if data is None:
+            return None
+        return snap_from_top(book_top(coin, data), now - ts)
+
+    def _diag_quotes(self, coin: str, n: int, *, take: bool) -> None:
+        if take or n <= 0 or self.diag is None:
+            return
+        try:
+            self.diag.note_quotes(coin, n)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("fill-diag quotes: %s", exc)
+
+    def on_user_fills(self, data: dict[str, Any]) -> None:
+        if self.diag is None:
+            return
+        fills = data.get("fills") if isinstance(data, dict) else None
+        if not isinstance(fills, list):
+            return
+        try:
+            self.diag.ingest_fills(fills, self.peek_book, prime=bool(data.get("isSnapshot")))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("fill-diag userFills: %s", exc)
+
+    def poll_user_fills(self, *, force: bool = False) -> None:
+        if self.diag is None:
+            return
+        now = time.time()
+        if not force and now - self.last_fill_poll < FILL_POLL_S:
+            return
+        rows = self.client.user_fills(self.signer.account, optional=True)
+        self.last_fill_poll = now
+        if rows is None:
+            return
+        try:
+            self.diag.ingest_fills(rows, self.peek_book, prime=not self.diag.primed)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("fill-diag userFills poll: %s", exc)
+
+    def flush_markouts(self) -> None:
+        if self.diag is None:
+            return
+        try:
+            self.diag.flush_markouts(self.peek_book)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("fill-diag markout: %s", exc)
 
     def bootstrap_isolated(self) -> None:
         for market in self.markets.values():
@@ -492,6 +558,7 @@ class LiveQuoter:
             return {"resp": resp}
         statuses = resp_statuses(resp)
         now = time.time()
+        accepted = 0
         for idx, (_side, intent) in enumerate(pending):
             st = statuses[idx] if idx < len(statuses) else None
             err = status_error(st)
@@ -499,6 +566,7 @@ class LiveQuoter:
                 if is_alo_reject(err):
                     log.warning("ALO px rejected, will requote %s %s", coin, err)
                     self.last_plan_key[coin] = ""
+                    self._diag_quotes(coin, accepted, take=plan.take)
                     return {"aloReject": True, "resp": resp}
                 if plan.take:
                     log.warning("IOC flatten status %s %s", coin, err)
@@ -516,12 +584,14 @@ class LiveQuoter:
                 placed_at=now,
             )
             self.rests[coin][intent.side] = slot
+            accepted += 1
         log.info(
             "%s %s %s",
             "take" if plan.take else "rest",
             coin,
             [(i.side, i.px, i.sz, i.tif, "ro" if i.reduce_only else "") for i in plan.intents],
         )
+        self._diag_quotes(coin, accepted, take=plan.take)
         return {"resp": resp}
 
     def requote(self, coin: str, top: BookTop) -> None:
@@ -613,10 +683,16 @@ class LiveQuoter:
         self.maybe_deadman()
 
     def step(self, feed: BookFeed | None) -> None:
+        self._feed = feed
         try:
             self.refresh_positions()
         except Exception as exc:  # noqa: BLE001
             log.warning("position poll: %s", exc)
+        try:
+            self.poll_user_fills()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("fill-diag poll: %s", exc)
+        self.flush_markouts()
         for coin in self.markets:
             try:
                 top = self.book_for(coin, feed)
@@ -710,6 +786,12 @@ def run_live(settings: Settings, *, seconds: float | None = None) -> int:
             "dead-man is account-wide: scheduleCancel +20s while running; "
             "clear (no time) on clean stop. Official min 5s; 429 fallback +6s."
         )
+        log.info(
+            "fill-diag observe-only: FILL_DIAG jsonl per fill (+3s markout) and "
+            "quote/fill counters split io:ANTH vs io:SNDK. SNDK session=rth|ah "
+            "(Mon–Fri 09:30–16:00 America/New_York; no holiday calendar). "
+            "AH markout stays in its own bucket."
+        )
         _log_agent(client, signer)
         user_state = client.clearinghouse_state(signer.account, ALLOWED_DEX, optional=True)
         if user_state:
@@ -729,7 +811,15 @@ def run_live(settings: Settings, *, seconds: float | None = None) -> int:
         signal.signal(signal.SIGINT, _handle)
         signal.signal(signal.SIGTERM, _handle)
 
-        feed = BookFeed(settings.ws_url, settings.coins, quoter.on_book)
+        quoter.poll_user_fills(force=True)
+        feed = BookFeed(
+            settings.ws_url,
+            settings.coins,
+            quoter.on_book,
+            user=signer.account,
+            on_user_fills=quoter.on_user_fills,
+        )
+        quoter._feed = feed
         feed.start()
         if not feed.wait_ready():
             log.error("websocket did not become ready")
@@ -746,6 +836,10 @@ def run_live(settings: Settings, *, seconds: float | None = None) -> int:
         if feed is not None:
             feed.stop()
         if quoter is not None:
+            try:
+                quoter.flush_markouts()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("fill-diag shutdown flush: %s", exc)
             try:
                 quoter.shutdown_cancels()
             except Exception as exc:  # noqa: BLE001

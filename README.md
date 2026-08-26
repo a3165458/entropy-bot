@@ -36,7 +36,13 @@ Per coin: at most **1 buy + 1 sell**. Isolated-only. Builder = Entropy `0xcD254d
 - `6–15s`: reduce-only ALO improved to mid (or 1 tick inside the near touch).
 - `≥15s`: cancel rests, reduce-only **IOC** take on the near touch (long sell@bid, short buy@ask).
 
-ALO / Bad Alo Px / post-only reject: log and requote; the loop does not stop. Stage / TIF / price change: cancel that coin's rests (local cache + `frontendOpenOrders` with `dex:"io"`) then place. Never place a side that already has an oid/cloid. HIP-3 oids exceed int32 — they are never truncated.
+ALO / Bad Alo Px / post-only reject: log and requote; the loop does not stop. Stage / TIF / price change: cancel that coin's rests (local cache + `frontendOpenOrders` with `dex:"io"`) then place — **throttled** by `MIN_REPLACE_S` (default 12s) per coin while a rest is live. A book tick alone does not cancel+replace until that interval passes. Flatten ≥15s IOC take still fires on schedule and is not serialized behind the same interval. Never place a side that already has an oid/cloid. HIP-3 oids exceed int32 — they are never truncated.
+
+### Request weight / write throttle
+
+Hyperliquid address-level cumulative request weight (`nRequestsUsed` vs `nRequestsCap`) scales with lifetime volume. **Waiting does not restore the cap.** After `Too many cumulative requests` / request-weight errors the bot logs **once** and backs off **all signed writes** for `max(MIN_REPLACE_S, 30s)`. It does not retry every book tick, does not buy `reserveRequestWeight`, and does not place taker-unlock spam.
+
+Current ops: run **ANTH-only** until weight recovers and NY RTH for SNDK. The default `COINS` example still lists `io:ANTH,io:SNDK`.
 
 WS `l2Book` for both coins. REST book only if WS is stale >15s. Inventory from `clearinghouseState` with `dex:"io"`. Open-order queries always send `dex:"io"`. A null/429 response does **not** wipe the local rest cache.
 
@@ -57,7 +63,7 @@ Fills come from the official `userFills` WS on the same connection (snapshot ign
 
 ### Dead-man (account-wide)
 
-While `live` is running the bot sends `scheduleCancel` at **now+20s** and renews it. Official minimum is 5s. On 429 it falls back to **+6s** (clamped ≥5s).
+While `live` is running the bot sends `scheduleCancel` at **now+20s** and refreshes **only when remaining time is under 8s** (not every few seconds). Official minimum is 5s. On 429 it falls back to **+6s** (clamped ≥5s). A dead-man failure caused by request weight is logged; it does not tight-loop.
 
 **This is account-wide.** When the timer fires, Hyperliquid cancels **all** open orders on the master account — not just `io:ANTH` / `io:SNDK`.
 
@@ -126,6 +132,9 @@ cp .env.example .env
 # set HYPERLIQUID_PRIVATE_KEY to the API/agent key (0x…)
 # set HYPERLIQUID_ACCOUNT to the master 0x… that holds ANTH/SNDK
 # QUOTE_NOTIONAL_USD=50
+# MIN_REPLACE_S=12
+# Current ops until request weight recovers + NY RTH for SNDK:
+# COINS=io:ANTH
 
 # tmux (simple)
 tmux new -s entropy
@@ -144,7 +153,8 @@ If the process dies without a clean stop, `scheduleCancel` fires and cancels **e
 | `LIVE` | `0` | Live only if `1` **and** a private key is set |
 | `HYPERLIQUID_PRIVATE_KEY` | unset | Agent or master key. Required for `live` / `cancel`. Never commit |
 | `HYPERLIQUID_ACCOUNT` | derived from key | Master address. Set this when the key is an agent |
-| `COINS` | `io:ANTH,io:SNDK` | Case-sensitive; foreign venues rejected |
+| `COINS` | `io:ANTH,io:SNDK` | Case-sensitive; foreign venues rejected. Current ops: ANTH-only until request weight recovers and NY RTH for SNDK |
+| `MIN_REPLACE_S` | `12` | Per-coin seconds between cancel+replace while a rest is live. Flatten ≥15s IOC take is not gated |
 | `QUOTE_NOTIONAL_USD` | `50` | Notional per side (live and paper), ≥ $10 |
 | `QUOTE_OFFSET_TICKS` | `2` | Legacy. Live ignores it |
 | `MAX_LEVERAGE` | `2` | Capped below each market max (ANTH 3 / SNDK 10) |
@@ -185,7 +195,9 @@ DEX 名是 **`io`**。不要用 `xyz` 或 `vntl`。
 
 ### 实盘策略（从 userscript 1.6.1 移植）
 
-每币最多 1 买 + 1 卖。空仓双边 ALO：价差 ≤2 tick 贴买卖一；价差 >2 tick 往中间贴（例 1985.00/1986.90/tick 0.1 → 买 1985.8 卖 1986.1）。有仓只减仓：`<6s` 远档 ALO，`6–15s` 中间 ALO，`≥15s` 撤后 IOC 吃单。空仓同价挂 45s 无成交则重挂。ALO 被拒不停止。Builder 是 Entropy、费率 0。
+每币最多 1 买 + 1 卖。空仓双边 ALO：价差 ≤2 tick 贴买卖一；价差 >2 tick 往中间贴（例 1985.00/1986.90/tick 0.1 → 买 1985.8 卖 1986.1）。有仓只减仓：`<6s` 远档 ALO，`6–15s` 中间 ALO，`≥15s` 撤后 IOC 吃单。空仓同价挂 45s 无成交则重挂。ALO 被拒不停止。Builder 是 Entropy、费率 0。挂单还在时，盘口跳动不会立刻撤换；每币至少隔 `MIN_REPLACE_S`（默认 12 秒）才 cancel+replace。≥15s 的 IOC 吃单仍按点触发，不受这 12 秒卡住。
+
+请求权重（`Too many cumulative requests`）等不等都不会把额度补回来。命中后只打一次日志，签名写操作退避 `max(MIN_REPLACE_S, 30s)`，不会每个 book tick 重试，也不买 `reserveRequestWeight`、不加 taker-unlock。当前运维：权重恢复且 SNDK 进入纽约 RTH 之前只跑 **ANTH**；示例 `COINS` 仍列出两个币。
 
 Tick 从盘口买卖价增量推断，不用 `tick_size(mid)`。
 
@@ -197,7 +209,7 @@ Tick 从盘口买卖价增量推断，不用 `tick_size(mid)`。
 
 ### Dead-man（账户级）
 
-运行中每约 8s 续期 `scheduleCancel` 到 **现在+20s**。官方最短 5s；429 则 +6s。到点后会撤销该主账户上的**全部**挂单，不限于 ANTH/SNDK。干净退出时发送不带 `time` 的 `scheduleCancel` 以清除定时。
+运行中把 `scheduleCancel` 设到 **现在+20s**，只在剩余时间 **< 8s** 时续期（不要隔几秒就刷）。官方最短 5s；429 则 +6s。权重耗尽导致的续期失败只记日志，不 tight-loop。到点后会撤销该主账户上的**全部**挂单，不限于 ANTH/SNDK。干净退出时发送不带 `time` 的 `scheduleCancel` 以清除定时。
 
 ### 命令
 

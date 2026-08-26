@@ -126,6 +126,18 @@ class InfoClient:
             raise ValueError("frontendOpenOrders expected a list")
         return data
 
+    def user_fills(self, user: str, *, optional: bool = True) -> list[dict[str, Any]] | None:
+        """Recent fills for the master account. Observe-only; 429/null → None."""
+        data = self.post_info({"type": "userFills", "user": user}, optional=optional)
+        if data is None:
+            return None
+        if not isinstance(data, list):
+            if optional:
+                log.warning("userFills returned non-list; treating as null")
+                return None
+            raise ValueError("userFills expected a list")
+        return [row for row in data if isinstance(row, dict)]
+
     def extra_agents(self, user: str, *, optional: bool = True) -> list[Any] | None:
         data = self.post_info({"type": "extraAgents", "user": user}, optional=optional, cacheable=True)
         if data is None:

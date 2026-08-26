@@ -28,7 +28,7 @@ from hyperliquid.utils.signing import (
 from hyperliquid.utils.types import Cloid
 
 from entropy_bot.coins import Market, assert_no_foreign_venue, assert_tradable
-from entropy_bot.errors import LiveGuardError
+from entropy_bot.errors import LiveGuardError, error_text, is_weight_limit_error
 
 log = logging.getLogger("entropy_bot.orders")
 
@@ -365,18 +365,7 @@ def status_error(st: Any) -> str:
 
 
 def blob_text(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return value
-    if isinstance(value, Exception):
-        return f"{value} {getattr(value, 'args', ())}"
-    try:
-        import json
-
-        return json.dumps(value)
-    except (TypeError, ValueError):
-        return str(value)
+    return error_text(value)
 
 
 def is_alo_reject(err: Any) -> bool:
@@ -394,7 +383,7 @@ def is_alo_reject(err: Any) -> bool:
 
 def is_rate_limited(err: Any) -> bool:
     text = blob_text(err)
-    return "429" in text or "rate limit" in text.lower()
+    return "429" in text or "rate limit" in text.lower() or is_weight_limit_error(text)
 
 
 def action_ok(resp: Any) -> bool:

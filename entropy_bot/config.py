@@ -23,6 +23,7 @@ DEFAULT_WS_URL = "wss://api.hyperliquid.xyz/ws"
 DEFAULT_NOTIONAL = 50.0
 DEFAULT_OFFSET_TICKS = 2
 DEFAULT_MAX_LEVERAGE = 2
+DEFAULT_MIN_REPLACE_S = 12.0
 MIN_ORDER_USD = 10.0
 
 
@@ -44,6 +45,7 @@ class Settings:
     entropy_self_rebate: float = DEFAULT_ENTROPY_SELF_REBATE
     entropy_referral_reward: float = DEFAULT_ENTROPY_REFERRAL_REWARD
     entropy_referred_user_benefit: float = DEFAULT_ENTROPY_REFERRED_USER_BENEFIT
+    min_replace_s: float = DEFAULT_MIN_REPLACE_S
 
     @property
     def paper(self) -> bool:
@@ -86,10 +88,13 @@ def load_settings(dotenv_path: str | Path | None = None) -> Settings:
         entropy_referred = (
             float(referred_raw) if referred_raw is not None else DEFAULT_ENTROPY_REFERRED_USER_BENEFIT
         )
+        min_replace_s = float(os.environ.get("MIN_REPLACE_S", DEFAULT_MIN_REPLACE_S))
     except ValueError as exc:
         raise ConfigError(f"invalid numeric config: {exc}") from exc
     if notional <= 0 or offset < 0 or max_lev < 1:
         raise ConfigError("QUOTE_NOTIONAL_USD, QUOTE_OFFSET_TICKS, MAX_LEVERAGE must be positive")
+    if min_replace_s < 0:
+        raise ConfigError("MIN_REPLACE_S must be >= 0")
     rates_for_tier(fee_tier)
     entropy_program(entropy_tier)
     if not 0.0 <= referral < 1.0:
@@ -117,6 +122,7 @@ def load_settings(dotenv_path: str | Path | None = None) -> Settings:
         entropy_self_rebate=entropy_self_rebate,
         entropy_referral_reward=entropy_referral_reward,
         entropy_referred_user_benefit=entropy_referred,
+        min_replace_s=min_replace_s,
     )
 
 

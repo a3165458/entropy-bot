@@ -45,7 +45,7 @@ from entropy_bot.quoting import (
     sync_pos_since,
 )
 from entropy_bot.diagnostics import BookSnap, FillDiagnostics, snap_from_top
-from entropy_bot.errors import RateLimited
+from entropy_bot.errors import RateLimited, RequestWeightLimited, is_weight_limit_error
 from entropy_bot.rest import InfoClient
 from entropy_bot.status import load_io_markets
 from entropy_bot.ws import BookFeed
@@ -59,8 +59,10 @@ LOOP_S = 0.4
 DEADMAN_AHEAD_MS = 20_000
 DEADMAN_MIN_MS = 5_000
 DEADMAN_FALLBACK_MS = 6_000
-DEADMAN_REFRESH_S = 8.0
+DEADMAN_REMAIN_LT_S = 8.0
+DEADMAN_REFRESH_S = DEADMAN_REMAIN_LT_S  # alias: refresh only when remaining < 8s
 IOC_GAP_S = 0.4
+WEIGHT_BACKOFF_FLOOR_S = 30.0
 
 
 @dataclass
@@ -226,6 +228,37 @@ def deadman_deadline_ms(ahead_ms: int, *, now_ms: int | None = None) -> int:
     return t
 
 
+def weight_backoff_s(min_replace_s: float, floor_s: float = WEIGHT_BACKOFF_FLOOR_S) -> float:
+    """Signed-write pause after a cumulative request-weight error. Waiting does not grow the cap."""
+    return max(float(min_replace_s), float(floor_s))
+
+
+def replace_allowed(
+    *,
+    take: bool,
+    has_rest: bool,
+    elapsed_s: float,
+    min_replace_s: float,
+) -> bool:
+    """Throttle mid/far/flat cancel+replace. Flatten ≥15s IOC take is always allowed."""
+    if take:
+        return True
+    if not has_rest:
+        return True
+    return elapsed_s >= min_replace_s
+
+
+def deadman_needs_refresh(
+    deadline_s: float,
+    now_s: float,
+    remain_lt_s: float = DEADMAN_REMAIN_LT_S,
+) -> bool:
+    """Renew scheduleCancel only when unset or remaining time is under 8s."""
+    if deadline_s <= 0:
+        return True
+    return (deadline_s - now_s) < remain_lt_s
+
+
 def side_occupied(rests: dict[str, dict[str, RestSlot]], coin: str, side: str) -> bool:
     slot = rests.get(coin, {}).get(side)
     return bool(slot and slot.occupied())
@@ -248,6 +281,11 @@ class LiveQuoter:
     last_pos_poll: float = 0.0
     last_fill_poll: float = 0.0
     last_deadman: float = 0.0
+    last_replace: dict[str, float] = field(default_factory=dict)
+    deadman_until: float = 0.0
+    _weight_backoff_until: float = 0.0
+    _weight_logged: bool = False
+    _replace_skip_logged: dict[str, bool] = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     books: dict[str, tuple[float, dict[str, Any]]] = field(default_factory=dict)
     diag: FillDiagnostics | None = None
@@ -265,8 +303,34 @@ class LiveQuoter:
             self.pos = {coin: 0.0 for coin in coins}
         if not self.pos_since:
             self.pos_since = {coin: 0.0 for coin in coins}
+        if not self.last_replace:
+            self.last_replace = {coin: 0.0 for coin in coins}
+        if not self._replace_skip_logged:
+            self._replace_skip_logged = {coin: False for coin in coins}
         if self.diag is None:
             self.diag = FillDiagnostics(coins)
+
+    def _in_weight_backoff(self) -> bool:
+        return time.time() < self._weight_backoff_until
+
+    def _trip_weight_backoff(self, err: object) -> None:
+        wait = weight_backoff_s(self.settings.min_replace_s)
+        self._weight_backoff_until = time.time() + wait
+        if not self._weight_logged:
+            log.warning(
+                "request weight exhausted; backing off signed writes for %.0fs "
+                "(waiting does not restore the cap): %s",
+                wait,
+                err,
+            )
+            self._weight_logged = True
+
+    def _mark_replaced(self, coin: str) -> None:
+        self.last_replace[coin] = time.time()
+        self._replace_skip_logged[coin] = False
+
+    def _has_rest(self, coin: str) -> bool:
+        return side_occupied(self.rests, coin, "B") or side_occupied(self.rests, coin, "A")
 
     def on_book(self, coin: str, data: dict[str, Any]) -> None:
         with self._lock:
@@ -413,29 +477,69 @@ class LiveQuoter:
         )
 
     def _post(self, payload: dict[str, Any]) -> Any:
-        return self.client.post_exchange(payload)
+        if self._in_weight_backoff():
+            left = self._weight_backoff_until - time.time()
+            raise RequestWeightLimited(f"signed write skipped; request-weight backoff {left:.1f}s left")
+        try:
+            resp = self.client.post_exchange(payload)
+        except RequestWeightLimited as exc:
+            self._trip_weight_backoff(exc)
+            raise
+        except RateLimited as exc:
+            if is_weight_limit_error(exc):
+                self._trip_weight_backoff(exc)
+            raise
+        except Exception as exc:  # noqa: BLE001
+            if is_weight_limit_error(exc):
+                self._trip_weight_backoff(exc)
+            raise
+        if is_weight_limit_error(resp):
+            exc = RequestWeightLimited(str(resp))
+            self._trip_weight_backoff(exc)
+            raise exc
+        if not self._in_weight_backoff():
+            self._weight_logged = False
+        return resp
 
     def schedule_deadman(self, ahead_ms: int = DEADMAN_AHEAD_MS) -> None:
         """Account-wide: cancels ALL open orders on the master when it fires."""
         deadline = deadman_deadline_ms(ahead_ms)
         try:
             resp = self._post(self.signer.signed_schedule_cancel(deadline))
-            self.last_deadman = time.time()
+            now = time.time()
+            self.last_deadman = now
+            self.deadman_until = deadline / 1000.0
             log.info("dead-man scheduleCancel +%ss account-wide -> %s", ahead_ms // 1000, resp)
+        except RequestWeightLimited:
+            return
         except RateLimited:
+            if self._in_weight_backoff():
+                return
             fallback = deadman_deadline_ms(DEADMAN_FALLBACK_MS)
             resp = self._post(self.signer.signed_schedule_cancel(fallback))
-            self.last_deadman = time.time()
+            now = time.time()
+            self.last_deadman = now
+            self.deadman_until = fallback / 1000.0
             log.warning("dead-man 429; fallback +%ss account-wide -> %s", DEADMAN_FALLBACK_MS // 1000, resp)
 
     def maybe_deadman(self) -> None:
-        if time.time() - self.last_deadman < DEADMAN_REFRESH_S:
+        now = time.time()
+        if self._in_weight_backoff():
+            return
+        if not deadman_needs_refresh(self.deadman_until, now):
             return
         try:
             self.schedule_deadman(DEADMAN_AHEAD_MS)
+        except RequestWeightLimited:
+            return
         except Exception as exc:  # noqa: BLE001
+            if is_weight_limit_error(exc):
+                self._trip_weight_backoff(exc)
+                return
             log.warning("dead-man renew failed: %s", exc)
-            self.last_deadman = time.time() - DEADMAN_REFRESH_S / 2
+            self.last_deadman = now
+            # Do not tight-loop: wait at least MIN_REPLACE_S before another attempt.
+            self.deadman_until = now + max(self.settings.min_replace_s, DEADMAN_REMAIN_LT_S)
 
     def clear_deadman(self) -> None:
         try:
@@ -595,6 +699,8 @@ class LiveQuoter:
         return {"resp": resp}
 
     def requote(self, coin: str, top: BookTop) -> None:
+        if self._in_weight_backoff():
+            return
         self.refresh_positions()
         plan = self.plan_for(coin, top)
         key = plan.key()
@@ -625,6 +731,8 @@ class LiveQuoter:
             self.last_take_at[coin] = now
             try:
                 self._place(coin, plan)
+            except RequestWeightLimited:
+                log.warning("IOC skipped %s; request-weight backoff", coin)
             except RateLimited:
                 log.warning("IOC 429 %s; continue", coin)
             except Exception as exc:  # noqa: BLE001
@@ -648,8 +756,28 @@ class LiveQuoter:
                 try:
                     self._cancel_pairs(coin, extras, [])
                     self.extra_oids[coin] = []
-                except Exception as exc:  # noqa: BLE001
-                    log.warning("sweep extras %s: %s", coin, exc)
+                except RequestWeightLimited:
+                    return
+                except Exception as extra_exc:  # noqa: BLE001
+                    log.warning("sweep extras %s: %s", coin, extra_exc)
+            self.maybe_deadman()
+            return
+        elapsed = time.time() - self.last_replace.get(coin, 0.0)
+        if not replace_allowed(
+            take=False,
+            has_rest=have_buy or have_sell,
+            elapsed_s=elapsed,
+            min_replace_s=self.settings.min_replace_s,
+        ):
+            if not self._replace_skip_logged.get(coin):
+                log.info(
+                    "min-replace: keep %s rests (%.1fs < MIN_REPLACE_S=%ss); "
+                    "mid/far/flat reprice skipped, take still allowed",
+                    coin,
+                    elapsed,
+                    self.settings.min_replace_s,
+                )
+                self._replace_skip_logged[coin] = True
             self.maybe_deadman()
             return
         if stale:
@@ -666,20 +794,29 @@ class LiveQuoter:
             log.warning("cancel before replace %s: %s", coin, exc)
         try:
             placed = self._place(coin, plan)
+        except RequestWeightLimited:
+            log.warning("place skipped %s; request-weight backoff", coin)
+            self._mark_replaced(coin)
+            return
         except RateLimited:
             log.warning("place 429 %s; continue loop", coin)
+            self._mark_replaced(coin)
             return
         except Exception as exc:  # noqa: BLE001
             if is_alo_reject(exc):
                 log.warning("ALO px rejected, will requote %s: %s", coin, exc)
                 self.last_plan_key[coin] = ""
+                self._mark_replaced(coin)
                 return
             log.warning("place failed %s: %s", coin, exc)
+            self._mark_replaced(coin)
             return
         if placed and placed.get("aloReject"):
+            self._mark_replaced(coin)
             return
         self.last_plan_key[coin] = key
         self.quote_placed_at[coin] = time.time() if plan.mode == "flat" else 0.0
+        self._mark_replaced(coin)
         self.maybe_deadman()
 
     def step(self, feed: BookFeed | None) -> None:
@@ -783,8 +920,19 @@ def run_live(settings: Settings, *, seconds: float | None = None) -> int:
         log.info("%s", describe_fee_model(settings))
         log.info("%s", ALO_TIF_NOTE)
         log.info(
-            "dead-man is account-wide: scheduleCancel +20s while running; "
-            "clear (no time) on clean stop. Official min 5s; 429 fallback +6s."
+            "dead-man is account-wide: scheduleCancel +20s; refresh only when "
+            "remaining < %ss (not every few seconds). Failed weight renew: log, no tight-loop. "
+            "Official min 5s; 429 fallback +6s. Clear (no time) on clean stop.",
+            int(DEADMAN_REMAIN_LT_S),
+        )
+        log.info(
+            "write throttle: MIN_REPLACE_S=%ss per coin while a rest is live "
+            "(book ticks do not cancel+replace). Flatten ≥15s IOC take still fires. "
+            "request-weight error backs off signed writes for %ss (log once). "
+            "ops: ANTH-only until weight recovers and NY RTH for SNDK "
+            "(COINS default still lists both).",
+            settings.min_replace_s,
+            weight_backoff_s(settings.min_replace_s),
         )
         log.info(
             "fill-diag observe-only: FILL_DIAG jsonl per fill (+3s markout) and "

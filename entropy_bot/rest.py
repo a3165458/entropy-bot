@@ -9,7 +9,7 @@ from typing import Any
 import requests
 
 from entropy_bot.coins import ALLOWED_DEX, assert_no_foreign_venue, assert_tradable
-from entropy_bot.errors import RateLimited
+from entropy_bot.errors import RateLimited, RequestWeightLimited, error_text, is_weight_limit_error
 
 log = logging.getLogger("entropy_bot.rest")
 
@@ -152,8 +152,16 @@ class InfoClient:
         except requests.RequestException as exc:
             raise RateLimited(f"exchange request failed: {exc}") from exc
         if response.status_code == 429:
+            text = response.text or "exchange 429"
+            if is_weight_limit_error(text):
+                raise RequestWeightLimited(text)
             raise RateLimited("exchange 429")
+        if not response.ok and is_weight_limit_error(response.text):
+            raise RequestWeightLimited(response.text)
         response.raise_for_status()
         if not response.content or response.content.strip() in {b"", b"null"}:
             return None
-        return response.json()
+        data = response.json()
+        if is_weight_limit_error(data):
+            raise RequestWeightLimited(error_text(data))
+        return data

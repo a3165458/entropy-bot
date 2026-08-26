@@ -26,7 +26,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("status", help="Print io meta + books. No key required.")
     paper = sub.add_parser("paper", help="Shadow-quote ALO on one WS. Never signs.")
     paper.add_argument("--seconds", type=float, default=None, help="Stop after N seconds")
-    live = sub.add_parser("live", help="Sign isolated ALO quotes. Requires LIVE=1 and a key.")
+    live = sub.add_parser(
+        "live",
+        help="Official HTTP+WS live MM (ALO + flatten ladder). Requires LIVE=1 and a key.",
+    )
     live.add_argument("--seconds", type=float, default=None, help="Stop after N seconds")
     sub.add_parser("cancel", help="Cancel resting bot cloIDs on ANTH/SNDK.")
     return parser

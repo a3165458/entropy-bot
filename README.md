@@ -40,6 +40,21 @@ ALO / Bad Alo Px / post-only reject: log and requote; the loop does not stop. St
 
 WS `l2Book` for both coins. REST book only if WS is stale >15s. Inventory from `clearinghouseState` with `dex:"io"`. Open-order queries always send `dex:"io"`. A null/429 response does **not** wipe the local rest cache.
 
+### Fill-rate / +3s markout (logging only)
+
+Live prints greppable `FILL_DIAG {...}` JSON lines. Quote path, flatten ladder, sizes, and prices are unchanged.
+
+Per fill (after 3s, using the already-subscribed `l2Book`; no extra WS):
+
+- `coin` (`io:ANTH` / `io:SNDK`), `side` (buy/sell), `fill_px`, `mid_at_fill`, `mid_3s`
+- `markout_bps`: buy `(mid_3s - fill_px)/fill_px * 1e4`; sell `(fill_px - mid_3s)/fill_px * 1e4`. If the book is stale >15s at +3s, `mid_3s` is null and markout is skipped.
+- `spread` (ask−bid) and `spread_bps` vs mid at fill time
+- counters on the same row: `quotes`, `fills`, `fill_rate` (`fills/quotes`, null if no quotes)
+
+ANTH and SNDK never share a bucket. SNDK rows also have `session=rth` or `session=ah`. Regular hours are Mon–Fri 09:30–16:00 `America/New_York`. **No holiday calendar** — a weekday cash holiday is still tagged `rth`. After-hours markout is dirty: it is logged and kept in the AH bucket only; it is never folded into an RTH average.
+
+Fills come from the official `userFills` WS on the same connection (snapshot ignored) with a REST `userFills` poll as backup. Quote counts increment only after an ALO rest is accepted, not after IOC flatten.
+
 ### Dead-man (account-wide)
 
 While `live` is running the bot sends `scheduleCancel` at **now+20s** and renews it. Official minimum is 5s. On 429 it falls back to **+6s** (clamped ≥5s).
@@ -173,6 +188,8 @@ DEX 名是 **`io`**。不要用 `xyz` 或 `vntl`。
 每币最多 1 买 + 1 卖。空仓双边 ALO：价差 ≤2 tick 贴买卖一；价差 >2 tick 往中间贴（例 1985.00/1986.90/tick 0.1 → 买 1985.8 卖 1986.1）。有仓只减仓：`<6s` 远档 ALO，`6–15s` 中间 ALO，`≥15s` 撤后 IOC 吃单。空仓同价挂 45s 无成交则重挂。ALO 被拒不停止。Builder 是 Entropy、费率 0。
 
 Tick 从盘口买卖价增量推断，不用 `tick_size(mid)`。
+
+实盘只多打 `FILL_DIAG` JSON 行：成交价、成交时 mid、+3s mid、方向化 markout（买后 mid 涨为正）、价差、以及按币分开的报价次数 / 成交次数 / fill rate。SNDK 带 `session=rth|ah`（纽约时间周一至周五 09:30–16:00 为 rth，**不含节假日日历**）。AH markout 单独桶，不并进 RTH。不改报价、撤单、仓位阶梯。
 
 ### 签名 / agent
 

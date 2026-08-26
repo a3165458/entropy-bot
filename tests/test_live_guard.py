@@ -62,6 +62,7 @@ def test_paper_does_not_require_key(monkeypatch):
     assert settings.entropy_self_rebate == 2.0
     assert settings.entropy_referral_reward == 1.0
     assert settings.entropy_referred_user_benefit == 0.0
+    assert settings.min_replace_s == 12.0
 
 
 def test_fee_env_optional_layers(monkeypatch):
@@ -84,6 +85,16 @@ def test_fee_env_optional_layers(monkeypatch):
     assert settings.entropy_self_rebate == 2.0
     assert settings.entropy_referral_reward == 1.0
     assert settings.entropy_referred_user_benefit == 0.0
+
+
+def test_min_replace_s_from_env(monkeypatch):
+    from entropy_bot.config import load_settings
+
+    monkeypatch.setenv("COINS", "io:ANTH")
+    monkeypatch.setenv("MIN_REPLACE_S", "15")
+    settings = load_settings()
+    assert settings.min_replace_s == 15.0
+    assert settings.coins == ("io:ANTH",)
 
 
 def test_env_rejects_xyz_coins(monkeypatch):

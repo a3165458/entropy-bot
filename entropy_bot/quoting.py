@@ -1,9 +1,10 @@
 """ALO two-sided quotes and flatten ladder from a multiplexed L2 book.
 
-Live MM (userscript 1.6.1):
+Live MM:
 - Tick comes from the live bid/ask increment, not tick_size(mid).
 - Flat: join BBO when spread ≤ 2 ticks; otherwise improve toward mid.
-- In position: reduce-only only — far ALO → mid ALO → IOC take.
+- In position: reduce-only only — far ALO → mid ALO. Never IOC / taker flatten.
+  Unfilled flatten ALO is cancel-and-replaced (same ALO path), not taken.
 """
 
 from __future__ import annotations
@@ -24,10 +25,12 @@ from entropy_bot.precision import (
 )
 
 FLAT_FAR_MS = 6_000
-FLAT_TAKE_MS = 15_000
+# Unfilled flatten ALO sits this long before cancel-and-replace (still ALO).
+# Was 15s IOC take; Quant: exit is maker-only, prefer cancel over taking.
+FLAT_STALE_MS = 90_000
 STALE_QUOTE_MS = 45_000
 
-Stage = Literal["flat", "far", "mid", "take"]
+Stage = Literal["flat", "far", "mid"]
 Mode = Literal["flat", "long", "short"]
 
 
@@ -256,8 +259,6 @@ def desired_quotes(
 def flatten_stage(age_ms: int, szi: float) -> Stage:
     if abs(szi) <= 0:
         return "flat"
-    if age_ms >= FLAT_TAKE_MS:
-        return "take"
     if age_ms >= FLAT_FAR_MS:
         return "mid"
     return "far"
@@ -272,8 +273,6 @@ def flatten_prices(market: Market, top: BookTop, stage: Stage) -> tuple[float, f
     if top.bid is None or top.ask is None or top.bid <= 0 or top.ask <= 0:
         return None
     tick = top.inferred_tick(market.sz_decimals)
-    if stage == "take":
-        return top.ask, top.bid  # short cover @ask / long exit @bid
     if stage == "mid":
         mid = top.mid if top.mid and top.mid > 0 else (top.bid + top.ask) / 2.0
         mid_px = _round_side(mid, market.sz_decimals, side="nearest")
@@ -317,20 +316,18 @@ def quote_plan(
                 )
         return QuotePlan(market.coin, "flat", "flat", "Alo", False, intents, 0, 0.0, buy_px, sell_px)
 
-    take = stage == "take"
-    tif = "Ioc" if take else "Alo"
+    tif = "Alo"
     raw = flatten_prices(market, top, stage)
     if raw is None:
-        return QuotePlan(market.coin, "long" if szi > 0 else "short", stage, tif, take, [], age_ms, szi)
+        return QuotePlan(market.coin, "long" if szi > 0 else "short", stage, tif, False, [], age_ms, szi)
     buy_raw, sell_raw = raw
     intents: list[QuoteIntent] = []
     buy_px = sell_px = None
     if szi > 0:
-        if not take:
-            sell_raw_c = clamp_maker_sell(market, top, sell_raw)
-            if sell_raw_c is None:
-                return QuotePlan(market.coin, "long", stage, tif, take, [], age_ms, szi)
-            sell_raw = sell_raw_c
+        sell_raw_c = clamp_maker_sell(market, top, sell_raw)
+        if sell_raw_c is None:
+            return QuotePlan(market.coin, "long", stage, tif, False, [], age_ms, szi)
+        sell_raw = sell_raw_c
         notional_sz = size_from_notional(notional_usd, sell_raw, market.sz_decimals)
         sz = flatten_size(abs(szi), notional_sz, market.sz_decimals)
         if sz > 0:
@@ -338,13 +335,12 @@ def quote_plan(
             intents.append(
                 QuoteIntent(market.coin, market.asset_id, False, sell_raw, sz, "A", tif, True, stage)
             )
-        return QuotePlan(market.coin, "long", stage, tif, take, intents, age_ms, szi, None, sell_px)
+        return QuotePlan(market.coin, "long", stage, tif, False, intents, age_ms, szi, None, sell_px)
 
-    if not take:
-        buy_raw_c = clamp_maker_buy(market, top, buy_raw)
-        if buy_raw_c is None:
-            return QuotePlan(market.coin, "short", stage, tif, take, [], age_ms, szi)
-        buy_raw = buy_raw_c
+    buy_raw_c = clamp_maker_buy(market, top, buy_raw)
+    if buy_raw_c is None:
+        return QuotePlan(market.coin, "short", stage, tif, False, [], age_ms, szi)
+    buy_raw = buy_raw_c
     notional_sz = size_from_notional(notional_usd, buy_raw, market.sz_decimals)
     sz = flatten_size(abs(szi), notional_sz, market.sz_decimals)
     if sz > 0:
@@ -352,7 +348,7 @@ def quote_plan(
         intents.append(
             QuoteIntent(market.coin, market.asset_id, True, buy_raw, sz, "B", tif, True, stage)
         )
-    return QuotePlan(market.coin, "short", stage, tif, take, intents, age_ms, szi, buy_px, None)
+    return QuotePlan(market.coin, "short", stage, tif, False, intents, age_ms, szi, buy_px, None)
 
 
 def sync_pos_since(

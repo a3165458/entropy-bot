@@ -113,21 +113,18 @@ def test_order_action_includes_entropy_builder(markets):
     assert action["builder"] == {"b": ENTROPY_BUILDER.lower(), "f": 0}
 
 
-def test_ioc_allowed_only_for_reduce_only_flatten(markets):
+def test_ioc_refused_even_for_reduce_only_flatten(markets):
     anth = markets["io:ANTH"]
-    ioc = order_wire(
-        asset_id=anth.asset_id,
-        is_buy=False,
-        limit_px=1985.0,
-        sz=0.02,
-        reduce_only=True,
-        tif="Ioc",
-    )
-    assert ioc["t"] == {"limit": {"tif": "Ioc"}}
-    assert ioc["r"] is True
-    action = order_action([ioc])
-    assert action["orders"][0]["t"]["limit"]["tif"] == "Ioc"
-    with pytest.raises(ValueError, match="reduce-only"):
+    with pytest.raises(ValueError, match="IOC refused"):
+        order_wire(
+            asset_id=anth.asset_id,
+            is_buy=False,
+            limit_px=1985.0,
+            sz=0.02,
+            reduce_only=True,
+            tif="Ioc",
+        )
+    with pytest.raises(ValueError, match="IOC refused"):
         order_wire(
             asset_id=anth.asset_id,
             is_buy=True,

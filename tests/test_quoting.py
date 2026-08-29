@@ -3,7 +3,7 @@ from __future__ import annotations
 from entropy_bot.precision import book_tick, tick_from_wire
 from entropy_bot.quoting import (
     FLAT_FAR_MS,
-    FLAT_TAKE_MS,
+    FLAT_STALE_MS,
     PaperState,
     QuoteIntent,
     book_top,
@@ -82,7 +82,8 @@ def test_flatten_stages(markets):
     assert flatten_stage(0, 0.0) == "flat"
     assert flatten_stage(1000, 0.02) == "far"
     assert flatten_stage(FLAT_FAR_MS, 0.02) == "mid"
-    assert flatten_stage(FLAT_TAKE_MS, 0.02) == "take"
+    assert flatten_stage(16_000, 0.02) == "mid"
+    assert flatten_stage(FLAT_STALE_MS, 0.02) == "mid"
 
     far = quote_plan(market, top, szi=0.02, age_ms=1000, notional_usd=50)
     assert far.mode == "long" and far.stage == "far" and far.tif == "Alo" and not far.take
@@ -93,27 +94,49 @@ def test_flatten_stages(markets):
     assert sell.sz == min(0.02, round(50 / 1986.9, 3)) or sell.sz <= 0.02
 
     mid = quote_plan(market, top, szi=0.02, age_ms=7_000, notional_usd=50)
-    assert mid.stage == "mid" and mid.tif == "Alo"
+    assert mid.stage == "mid" and mid.tif == "Alo" and not mid.take
     assert mid.intents[0].is_buy is False and mid.intents[0].reduce_only is True
     # mid or 1 tick inside near touch (bid+tick)
     assert 1985.0 < mid.intents[0].px <= 1986.9
+    assert mid.intents[0].px != 1985.0  # never sell the bid (that was IOC take)
 
-    take = quote_plan(market, top, szi=0.02, age_ms=16_000, notional_usd=50)
-    assert take.stage == "take" and take.take and take.tif == "Ioc"
-    assert take.intents[0].px == 1985.0  # long sells the bid
-    assert take.intents[0].reduce_only is True
+    aged = quote_plan(market, top, szi=0.02, age_ms=16_000, notional_usd=50)
+    assert aged.stage == "mid" and not aged.take and aged.tif == "Alo"
+    assert aged.intents[0].reduce_only is True
+    assert aged.intents[0].tif == "Alo"
+    assert aged.intents[0].px == mid.intents[0].px  # still maker mid, not bid take
+    assert aged.intents[0].px != 1985.0
 
     short = quote_plan(market, top, szi=-0.02, age_ms=1000, notional_usd=50)
     assert short.mode == "short" and short.intents[0].is_buy is True
     assert short.intents[0].reduce_only is True
     assert short.intents[0].px == 1985.0  # far touch bid
 
-    short_take = quote_plan(market, top, szi=-0.02, age_ms=16_000, notional_usd=50)
-    assert short_take.take and short_take.intents[0].px == 1986.9  # cover the ask
+    short_aged = quote_plan(market, top, szi=-0.02, age_ms=16_000, notional_usd=50)
+    assert not short_aged.take and short_aged.tif == "Alo"
+    assert short_aged.intents[0].tif == "Alo"
+    assert short_aged.intents[0].px != 1986.9  # never cover the ask (that was IOC take)
+    assert 1985.0 <= short_aged.intents[0].px < 1986.9
 
     flat = quote_plan(market, top, szi=0.0, age_ms=99_000, notional_usd=50)
     assert flat.mode == "flat" and not flat.take and len(flat.intents) == 2
     assert all(not i.reduce_only and i.tif == "Alo" for i in flat.intents)
+
+
+def test_flatten_never_emits_ioc_any_age_any_coin(markets):
+    ages = (0, 1_000, 6_000, 15_000, 16_000, 90_000, 180_000)
+    sizes = (0.02, -0.02, 0.041, -0.041)
+    for coin in ("io:ANTH", "io:SNDK"):
+        top = book_top(coin, _book(coin, "1985.00", "1986.90"))
+        for age in ages:
+            for szi in sizes:
+                plan = quote_plan(markets[coin], top, szi=szi, age_ms=age, notional_usd=50)
+                assert plan.tif == "Alo"
+                assert not plan.take
+                assert plan.stage in {"flat", "far", "mid"}
+                assert all(i.tif == "Alo" for i in plan.intents)
+                assert all(i.reduce_only for i in plan.intents)
+                assert len(plan.intents) == 1
 
 
 def test_flatten_size_is_min_notional_and_position(markets):

@@ -217,6 +217,38 @@ def test_sndk_fill_time_tags_session_and_keeps_markout_buckets_apart():
     assert all(row.get("session") in {"rth", "ah"} for row in diag.rows if row.get("coin") == SNDK)
 
 
+def test_maker_flatten_fill_records_plus_3s_markout():
+    """FILL_DIAG must still log maker flatten fills (there is no IOC flatten)."""
+    diag = FillDiagnostics((ANTH, SNDK))
+    quoted = diag.note_quotes(ANTH, 1)
+    assert quoted is not None and quoted["quotes"] == 1
+    state = {"mid": 1986.0, "age": 0.1}
+    peek = lambda _coin: _snap(state["mid"], age=state["age"], spread=1.9)
+    pending = diag.ingest_fills(
+        [{"coin": "io:ANTH", "side": "A", "px": "1986.1", "tid": 501}],
+        peek,
+        now=10.0,
+    )
+    assert len(pending) == 1
+    assert pending[0].side == "sell"
+    assert pending[0].fill_px == 1986.1
+    assert pending[0].mid_at_fill == 1986.0
+    rows = diag.flush_markouts(peek, now=13.0)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["type"] == "fill"
+    assert row["coin"] == ANTH
+    assert row["side"] == "sell"
+    assert row["fill_px"] == 1986.1
+    assert row["mid_at_fill"] == 1986.0
+    assert row["mid_3s"] == 1986.0
+    assert row["markout_bps"] == (1986.1 - 1986.0) / 1986.1 * 10_000.0
+    assert row["spread"] == 1.9
+    assert row["quotes"] == 1
+    assert row["fills"] == 1
+    assert row["fill_rate"] == 1.0
+
+
 def test_foreign_or_unknown_coins_ignored():
     diag = FillDiagnostics((ANTH, SNDK))
     peek = lambda _c: _snap(1.0)

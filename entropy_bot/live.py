@@ -37,6 +37,7 @@ from entropy_bot.orders import (
     status_oid,
 )
 from entropy_bot.quoting import (
+    FLAT_STALE_MS,
     STALE_QUOTE_MS,
     BookTop,
     QuotePlan,
@@ -61,7 +62,6 @@ DEADMAN_MIN_MS = 5_000
 DEADMAN_FALLBACK_MS = 6_000
 DEADMAN_REMAIN_LT_S = 8.0
 DEADMAN_REFRESH_S = DEADMAN_REMAIN_LT_S  # alias: refresh only when remaining < 8s
-IOC_GAP_S = 0.4
 WEIGHT_BACKOFF_FLOOR_S = 30.0
 
 
@@ -235,14 +235,11 @@ def weight_backoff_s(min_replace_s: float, floor_s: float = WEIGHT_BACKOFF_FLOOR
 
 def replace_allowed(
     *,
-    take: bool,
     has_rest: bool,
     elapsed_s: float,
     min_replace_s: float,
 ) -> bool:
-    """Throttle mid/far/flat cancel+replace. Flatten ≥15s IOC take is always allowed."""
-    if take:
-        return True
+    """Throttle two-sided and flatten ALO cancel+replace alike. No IOC bypass."""
     if not has_rest:
         return True
     return elapsed_s >= min_replace_s
@@ -277,7 +274,6 @@ class LiveQuoter:
     pos_since: dict[str, float] = field(default_factory=dict)
     last_plan_key: dict[str, str] = field(default_factory=dict)
     quote_placed_at: dict[str, float] = field(default_factory=dict)
-    last_take_at: dict[str, float] = field(default_factory=dict)
     last_pos_poll: float = 0.0
     last_fill_poll: float = 0.0
     last_deadman: float = 0.0
@@ -353,8 +349,9 @@ class LiveQuoter:
             return None
         return snap_from_top(book_top(coin, data), now - ts)
 
-    def _diag_quotes(self, coin: str, n: int, *, take: bool) -> None:
-        if take or n <= 0 or self.diag is None:
+    def _diag_quotes(self, coin: str, n: int) -> None:
+        """Count accepted ALO rests (two-sided and flatten). There is no IOC flatten."""
+        if n <= 0 or self.diag is None:
             return
         try:
             self.diag.note_quotes(coin, n)
@@ -615,12 +612,16 @@ class LiveQuoter:
     def _place(self, coin: str, plan: QuotePlan) -> dict[str, Any] | None:
         if not plan.intents:
             return None
+        if plan.take or any(str(i.tif).lower() == "ioc" for i in plan.intents):
+            raise ValueError("refusing IOC flatten; exit is maker ALO only")
         specs = []
         pending: list[tuple[str, Any]] = []
         for intent in plan.intents:
             if side_occupied(self.rests, coin, intent.side):
                 log.warning("refuse duplicate %s %s; oid/cloid already cached", coin, intent.side)
                 continue
+            if str(intent.tif).lower() != "alo":
+                raise ValueError(f"refusing non-ALO flatten/quote tif={intent.tif!r}")
             cloid = self.signer.next_cloid(intent.coin, intent.side)  # type: ignore[arg-type]
             specs.append(
                 (
@@ -630,7 +631,7 @@ class LiveQuoter:
                     intent.sz,
                     cloid,
                     intent.reduce_only,
-                    intent.tif,
+                    "Alo",
                 )
             )
             pending.append((intent.side, intent))
@@ -644,16 +645,10 @@ class LiveQuoter:
             log.warning("place 429 %s", coin)
             raise
         if is_alo_reject(resp):
-            if plan.take:
-                log.warning("IOC flatten missed %s %s", coin, resp)
-                return {"iocFail": True, "resp": resp}
             log.warning("ALO px rejected, will requote %s %s", coin, resp)
             self.last_plan_key[coin] = ""
             return {"aloReject": True, "resp": resp}
         if not action_ok(resp):
-            if plan.take:
-                log.warning("IOC flatten failed %s %s", coin, resp)
-                return {"iocFail": True, "resp": resp}
             if is_alo_reject(resp):
                 log.warning("ALO px rejected, will requote %s", coin)
                 self.last_plan_key[coin] = ""
@@ -670,11 +665,8 @@ class LiveQuoter:
                 if is_alo_reject(err):
                     log.warning("ALO px rejected, will requote %s %s", coin, err)
                     self.last_plan_key[coin] = ""
-                    self._diag_quotes(coin, accepted, take=plan.take)
+                    self._diag_quotes(coin, accepted)
                     return {"aloReject": True, "resp": resp}
-                if plan.take:
-                    log.warning("IOC flatten status %s %s", coin, err)
-                    return {"iocFail": True, "resp": resp}
                 log.warning("order status %s %s", coin, err)
                 continue
             oid = status_oid(st)
@@ -683,19 +675,18 @@ class LiveQuoter:
                 cloid=specs[idx][4],
                 px=intent.px,
                 sz=intent.sz,
-                tif=intent.tif,
+                tif="Alo",
                 reduce_only=intent.reduce_only,
                 placed_at=now,
             )
             self.rests[coin][intent.side] = slot
             accepted += 1
         log.info(
-            "%s %s %s",
-            "take" if plan.take else "rest",
+            "rest %s %s",
             coin,
-            [(i.side, i.px, i.sz, i.tif, "ro" if i.reduce_only else "") for i in plan.intents],
+            [(i.side, i.px, i.sz, "Alo", "ro" if i.reduce_only else "") for i in plan.intents],
         )
-        self._diag_quotes(coin, accepted, take=plan.take)
+        self._diag_quotes(coin, accepted)
         return {"resp": resp}
 
     def requote(self, coin: str, top: BookTop) -> None:
@@ -703,48 +694,17 @@ class LiveQuoter:
             return
         self.refresh_positions()
         plan = self.plan_for(coin, top)
+        if plan.take or plan.tif.lower() == "ioc" or any(str(i.tif).lower() == "ioc" for i in plan.intents):
+            raise ValueError("refusing IOC flatten; exit is maker ALO only")
         key = plan.key()
-        stale = (
-            plan.mode == "flat"
-            and self.quote_placed_at.get(coin, 0) > 0
-            and (time.time() - self.quote_placed_at[coin]) * 1000 > STALE_QUOTE_MS
-        )
+        placed_at = self.quote_placed_at.get(coin, 0.0)
+        stale_ms = STALE_QUOTE_MS if plan.mode == "flat" else FLAT_STALE_MS
+        stale = placed_at > 0 and (time.time() - placed_at) * 1000 > stale_ms
         have_buy = side_occupied(self.rests, coin, "B")
         have_sell = side_occupied(self.rests, coin, "A")
         want_buy = any(i.is_buy for i in plan.intents)
         want_sell = any(not i.is_buy for i in plan.intents)
         same_coverage = have_buy == want_buy and have_sell == want_sell
-        if plan.take:
-            now = time.time()
-            if now - self.last_take_at.get(coin, 0.0) < IOC_GAP_S:
-                self.maybe_deadman()
-                return
-            log.info("flatten take %s age=%.1fs szi=%s", coin, plan.age_ms / 1000, plan.szi)
-            try:
-                self.cancel_coin_rests(refetch=True)
-            except Exception as exc:  # noqa: BLE001
-                log.warning("cancel before IOC %s: %s", coin, exc)
-            if side_occupied(self.rests, coin, "B") or side_occupied(self.rests, coin, "A"):
-                log.warning("still have rests after cancel; skip IOC place %s", coin)
-                self.maybe_deadman()
-                return
-            self.last_take_at[coin] = now
-            try:
-                self._place(coin, plan)
-            except RequestWeightLimited:
-                log.warning("IOC skipped %s; request-weight backoff", coin)
-            except RateLimited:
-                log.warning("IOC 429 %s; continue", coin)
-            except Exception as exc:  # noqa: BLE001
-                if is_alo_reject(exc):
-                    log.warning("ALO/post-only reject on take path %s: %s", coin, exc)
-                else:
-                    log.warning("IOC flatten retry %s: %s", coin, exc)
-            self.last_plan_key[coin] = ""
-            self.quote_placed_at[coin] = 0.0
-            self.refresh_positions(force=True)
-            self.maybe_deadman()
-            return
         if not plan.intents:
             log.warning("no maker plan %s; skip", coin)
             self.last_plan_key[coin] = ""
@@ -764,7 +724,6 @@ class LiveQuoter:
             return
         elapsed = time.time() - self.last_replace.get(coin, 0.0)
         if not replace_allowed(
-            take=False,
             has_rest=have_buy or have_sell,
             elapsed_s=elapsed,
             min_replace_s=self.settings.min_replace_s,
@@ -772,7 +731,7 @@ class LiveQuoter:
             if not self._replace_skip_logged.get(coin):
                 log.info(
                     "min-replace: keep %s rests (%.1fs < MIN_REPLACE_S=%ss); "
-                    "mid/far/flat reprice skipped, take still allowed",
+                    "mid/far/flat/flatten ALO reprice skipped (no IOC)",
                     coin,
                     elapsed,
                     self.settings.min_replace_s,
@@ -781,7 +740,12 @@ class LiveQuoter:
             self.maybe_deadman()
             return
         if stale:
-            log.info("stale same-price rest >45s, cancel+replace %s", coin)
+            log.info(
+                "stale same-price rest >%.0fs, cancel+replace ALO %s stage=%s",
+                stale_ms / 1000,
+                coin,
+                plan.stage,
+            )
         else:
             log.info("plan change, cancel then place %s stage=%s tif=%s", coin, plan.stage, plan.tif)
         try:
@@ -815,7 +779,7 @@ class LiveQuoter:
             self._mark_replaced(coin)
             return
         self.last_plan_key[coin] = key
-        self.quote_placed_at[coin] = time.time() if plan.mode == "flat" else 0.0
+        self.quote_placed_at[coin] = time.time()
         self._mark_replaced(coin)
         self.maybe_deadman()
 
@@ -927,7 +891,8 @@ def run_live(settings: Settings, *, seconds: float | None = None) -> int:
         )
         log.info(
             "write throttle: MIN_REPLACE_S=%ss per coin while a rest is live "
-            "(book ticks do not cancel+replace). Flatten ≥15s IOC take still fires. "
+            "(book ticks do not cancel+replace). Flatten stays maker ALO "
+            "(far→mid, then cancel+replace; no IOC). "
             "request-weight error backs off signed writes for %ss (log once). "
             "ops: ANTH-only until weight recovers and NY RTH for SNDK "
             "(COINS default still lists both).",
@@ -936,7 +901,8 @@ def run_live(settings: Settings, *, seconds: float | None = None) -> int:
         )
         log.info(
             "fill-diag observe-only: FILL_DIAG jsonl per fill (+3s markout) and "
-            "quote/fill counters split io:ANTH vs io:SNDK. SNDK session=rth|ah "
+            "quote/fill counters split io:ANTH vs io:SNDK. Quote counts increment "
+            "on accepted ALO (two-sided and flatten). SNDK session=rth|ah "
             "(Mon–Fri 09:30–16:00 America/New_York; no holiday calendar). "
             "AH markout stays in its own bucket."
         )

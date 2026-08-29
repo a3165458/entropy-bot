@@ -19,7 +19,7 @@ No entropy.io scraping, no third-party order relays, no userscript bridge.
 
 **Paper / shadow mode is the default.** Live signing happens only when `LIVE=1` **and** `HYPERLIQUID_PRIVATE_KEY` is set.
 
-### Live MM (userscript 1.6.1 port)
+### Live MM (userscript 1.6.2 port)
 
 Per coin: at most **1 buy + 1 sell**. Isolated-only. Builder = Entropy `0xcD254d2A328f7f67C7c6FEf930A4757516F7b601` fee **0**. Tick is inferred from the live bid/ask increment (usually 0.1 at ANTH ~1985) — not `tick_size(mid)`, which returns 1.0 at 5 sigfigs.
 
@@ -33,10 +33,10 @@ Per coin: at most **1 buy + 1 sell**. Isolated-only. Builder = Entropy `0xcD254d
 
 - Long: only reduce-only sell. Short: only reduce-only buy.
 - `<6s`: reduce-only ALO at the far touch (long sell@ask, short buy@bid).
-- `6–15s`: reduce-only ALO improved to mid (or 1 tick inside the near touch).
-- `≥15s`: cancel rests, reduce-only **IOC** take on the near touch (long sell@bid, short buy@ask).
+- `≥6s`: reduce-only ALO improved to mid (or 1 tick inside the near touch). Stay maker.
+- Unfilled flatten ALO: after **90s** at the same price, cancel-and-replace the ALO (same maker path). Never IOC / taker flatten. Prefer cancel over taking.
 
-ALO / Bad Alo Px / post-only reject: log and requote; the loop does not stop. Stage / TIF / price change: cancel that coin's rests (local cache + `frontendOpenOrders` with `dex:"io"`) then place — **throttled** by `MIN_REPLACE_S` (default 12s) per coin while a rest is live. A book tick alone does not cancel+replace until that interval passes. Flatten ≥15s IOC take still fires on schedule and is not serialized behind the same interval. Never place a side that already has an oid/cloid. HIP-3 oids exceed int32 — they are never truncated.
+ALO / Bad Alo Px / post-only reject: log and requote; the loop does not stop. Stage / TIF / price change: cancel that coin's rests (local cache + `frontendOpenOrders` with `dex:"io"`) then place — **throttled** by `MIN_REPLACE_S` (default 12s) per coin while a rest is live. A book tick alone does not cancel+replace until that interval passes. Flatten uses the same ALO cancel+replace path (no IOC bypass). Never place a side that already has an oid/cloid. HIP-3 oids exceed int32 — they are never truncated.
 
 ### Request weight / write throttle
 
@@ -48,7 +48,7 @@ WS `l2Book` for both coins. REST book only if WS is stale >15s. Inventory from `
 
 ### Fill-rate / +3s markout (logging only)
 
-Live prints greppable `FILL_DIAG {...}` JSON lines. Quote path, flatten ladder, sizes, and prices are unchanged.
+Live prints greppable `FILL_DIAG {...}` JSON lines. Sizes and two-sided quote prices are unchanged. Flatten stays maker ALO (no IOC).
 
 Per fill (after 3s, using the already-subscribed `l2Book`; no extra WS):
 
@@ -59,7 +59,7 @@ Per fill (after 3s, using the already-subscribed `l2Book`; no extra WS):
 
 ANTH and SNDK never share a bucket. SNDK rows also have `session=rth` or `session=ah`. Regular hours are Mon–Fri 09:30–16:00 `America/New_York`. **No holiday calendar** — a weekday cash holiday is still tagged `rth`. After-hours markout is dirty: it is logged and kept in the AH bucket only; it is never folded into an RTH average.
 
-Fills come from the official `userFills` WS on the same connection (snapshot ignored) with a REST `userFills` poll as backup. Quote counts increment only after an ALO rest is accepted, not after IOC flatten.
+Fills come from the official `userFills` WS on the same connection (snapshot ignored) with a REST `userFills` poll as backup. Quote counts increment after an accepted ALO rest (two-sided or flatten). There is no IOC flatten.
 
 ### Dead-man (account-wide)
 
@@ -154,7 +154,7 @@ If the process dies without a clean stop, `scheduleCancel` fires and cancels **e
 | `HYPERLIQUID_PRIVATE_KEY` | unset | Agent or master key. Required for `live` / `cancel`. Never commit |
 | `HYPERLIQUID_ACCOUNT` | derived from key | Master address. Set this when the key is an agent |
 | `COINS` | `io:ANTH,io:SNDK` | Case-sensitive; foreign venues rejected. Current ops: ANTH-only until request weight recovers and NY RTH for SNDK |
-| `MIN_REPLACE_S` | `12` | Per-coin seconds between cancel+replace while a rest is live. Flatten ≥15s IOC take is not gated |
+| `MIN_REPLACE_S` | `12` | Per-coin seconds between cancel+replace while a rest is live. Flatten ALO uses the same gate |
 | `QUOTE_NOTIONAL_USD` | `50` | Notional per side (live and paper), ≥ $10 |
 | `QUOTE_OFFSET_TICKS` | `2` | Legacy. Live ignores it |
 | `MAX_LEVERAGE` | `2` | Capped below each market max (ANTH 3 / SNDK 10) |
@@ -168,7 +168,7 @@ If the process dies without a clean stop, `scheduleCancel` fires and cancels **e
 | `HYPERLIQUID_API_URL` | official mainnet | Official host required |
 | `HYPERLIQUID_WS_URL` | official mainnet | Official host required |
 
-Markets are **isolated-only**. Live sets isolated leverage per coin and never uses cross. Default TIF is ALO for two-sided quotes; flatten ≥15s may IOC take.
+Markets are **isolated-only**. Live sets isolated leverage per coin and never uses cross. Default TIF is ALO for two-sided quotes and flatten/exit. IOC is refused.
 
 ### Tests
 
@@ -193,15 +193,15 @@ DEX 名是 **`io`**。不要用 `xyz` 或 `vntl`。
 
 接口：`https://api.hyperliquid.xyz` 与 `wss://api.hyperliquid.xyz/ws`。
 
-### 实盘策略（从 userscript 1.6.1 移植）
+### 实盘策略（从 userscript 1.6.2 移植）
 
-每币最多 1 买 + 1 卖。空仓双边 ALO：价差 ≤2 tick 贴买卖一；价差 >2 tick 往中间贴（例 1985.00/1986.90/tick 0.1 → 买 1985.8 卖 1986.1）。有仓只减仓：`<6s` 远档 ALO，`6–15s` 中间 ALO，`≥15s` 撤后 IOC 吃单。空仓同价挂 45s 无成交则重挂。ALO 被拒不停止。Builder 是 Entropy、费率 0。挂单还在时，盘口跳动不会立刻撤换；每币至少隔 `MIN_REPLACE_S`（默认 12 秒）才 cancel+replace。≥15s 的 IOC 吃单仍按点触发，不受这 12 秒卡住。
+每币最多 1 买 + 1 卖。空仓双边 ALO：价差 ≤2 tick 贴买卖一；价差 >2 tick 往中间贴（例 1985.00/1986.90/tick 0.1 → 买 1985.8 卖 1986.1）。有仓只减仓：`<6s` 远档 ALO，`≥6s` 中间 ALO，超时只撤换 ALO（90s），**不 IOC 吃单**。空仓同价挂 45s 无成交则重挂。ALO 被拒不停止。Builder 是 Entropy、费率 0。挂单还在时，盘口跳动不会立刻撤换；每币至少隔 `MIN_REPLACE_S`（默认 12 秒）才 cancel+replace。平仓走同一条 maker ALO 路径，没有 IOC 旁路。
 
 请求权重（`Too many cumulative requests`）等不等都不会把额度补回来。命中后只打一次日志，签名写操作退避 `max(MIN_REPLACE_S, 30s)`，不会每个 book tick 重试，也不买 `reserveRequestWeight`、不加 taker-unlock。当前运维：权重恢复且 SNDK 进入纽约 RTH 之前只跑 **ANTH**；示例 `COINS` 仍列出两个币。
 
 Tick 从盘口买卖价增量推断，不用 `tick_size(mid)`。
 
-实盘只多打 `FILL_DIAG` JSON 行：成交价、成交时 mid、+3s mid、方向化 markout（买后 mid 涨为正）、价差、以及按币分开的报价次数 / 成交次数 / fill rate。SNDK 带 `session=rth|ah`（纽约时间周一至周五 09:30–16:00 为 rth，**不含节假日日历**）。AH markout 单独桶，不并进 RTH。不改报价、撤单、仓位阶梯。
+实盘只多打 `FILL_DIAG` JSON 行：成交价、成交时 mid、+3s mid、方向化 markout（买后 mid 涨为正）、价差、以及按币分开的报价次数 / 成交次数 / fill rate（含 maker 平仓成交）。SNDK 带 `session=rth|ah`（纽约时间周一至周五 09:30–16:00 为 rth，**不含节假日日历**）。AH markout 单独桶，不并进 RTH。报价次数在 ALO 挂单被接受后累加（双边和平仓侧都算）。
 
 ### 签名 / agent
 

@@ -1,6 +1,6 @@
 """Signed L1 order / cancel payloads.
 
-Two-sided maker quotes stay ALO. Reduce-only flatten ≥15s may use IOC.
+Two-sided maker quotes and reduce-only flatten both stay ALO. IOC is refused.
 Builder is always Entropy (fee 0) so the rebate path matches the userscript.
 
 Agent vs master (official SDK, not a guess):
@@ -33,7 +33,7 @@ from entropy_bot.errors import LiveGuardError, error_text, is_weight_limit_error
 log = logging.getLogger("entropy_bot.orders")
 
 DEFAULT_TIF = "Alo"
-ALLOWED_TIFS = frozenset({"Alo", "Ioc"})
+ALLOWED_TIFS = frozenset({"Alo"})
 BOT_CLOID_PREFIX = "0x45424f54"  # "EBOT"
 ENTROPY_BUILDER = "0xcD254d2A328f7f67C7c6FEf930A4757516F7b601"
 ENTROPY_BUILDER_FEE = 0  # tenths of a basis point
@@ -93,7 +93,7 @@ def as_oid(value: Any) -> int:
 def _normalize_tif(tif: str) -> str:
     raw = str(tif or DEFAULT_TIF)
     if raw.lower() == "ioc":
-        return "Ioc"
+        raise ValueError("IOC refused; flatten/exit is maker ALO only")
     return "Alo"
 
 
@@ -112,8 +112,8 @@ def order_wire(
     tif_n = _normalize_tif(tif)
     if tif_n not in ALLOWED_TIFS:
         raise ValueError(f"unsupported tif={tif!r}")
-    if tif_n != "Alo" and not reduce_only:
-        raise ValueError("non-ALO TIF is only allowed for reduce-only flatten take")
+    if tif_n != "Alo":
+        raise ValueError("non-ALO TIF refused; flatten/exit is maker ALO only")
     order: dict[str, Any] = {
         "coin": "",  # unused once asset_id is supplied
         "is_buy": is_buy,
@@ -164,9 +164,7 @@ def order_action(wires: list[dict[str, Any]], *, builder: dict[str, Any] | None 
         reduce_only = bool(order.get("r"))
         if tif == "Alo":
             continue
-        if tif == "Ioc" and reduce_only:
-            continue
-        raise ValueError(f"refusing non-ALO two-sided maker tif={tif!r} reduce_only={reduce_only}")
+        raise ValueError(f"refusing non-ALO tif={tif!r} reduce_only={reduce_only}")
     return action
 
 

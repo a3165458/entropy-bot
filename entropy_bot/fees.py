@@ -55,7 +55,7 @@ MAKER_SHARE_REBATE_BPS: dict[float, float] = {
     3.0: 0.3,
 }
 
-ALO_TIF_NOTE = "default TIF=ALO (two-sided maker quotes); flatten ≥15s may IOC take"
+ALO_TIF_NOTE = "default TIF=ALO (two-sided maker quotes); flatten/exit is maker ALO only (no IOC)"
 
 
 @dataclass(frozen=True)

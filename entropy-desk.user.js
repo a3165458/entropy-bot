@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Entropy Desk · ANTH / SNDK
 // @namespace    entropy-desk
-// @version      1.6.1
-// @description  ALO-quote io:ANTH / io:SNDK; flatten escalate ALO→mid→IOC take
+// @version      1.6.2
+// @description  ALO-quote io:ANTH / io:SNDK; flatten reduce-only ALO only (no IOC)
 // @match        https://entropy.io/*
 // @match        https://app.hyperliquid.xyz/*
 // @run-at       document-idle
@@ -19,7 +19,7 @@
   var DEX = "io";
   var POLL_MS = 400;
   var FLAT_FAR_MS = 6000;
-  var FLAT_TAKE_MS = 15000;
+  var FLAT_STALE_MS = 90000;
   var STALE_QUOTE_MS = 45000;
   var EXCHANGE_URL = "https://api.hyperliquid.xyz/exchange";
   var BUILDER = "0xcD254d2A328f7f67C7c6FEf930A4757516F7b601";
@@ -73,8 +73,7 @@
     posTs: 0,
     posForce: false,
     posSince: { "io:ANTH": 0, "io:SNDK": 0 },
-    quotePlacedAt: { "io:ANTH": 0, "io:SNDK": 0 },
-    lastTakeAt: { "io:ANTH": 0, "io:SNDK": 0 }
+    quotePlacedAt: { "io:ANTH": 0, "io:SNDK": 0 }
   };
   function anyAutoCoin() {
     for (var i = 0; i < ALLOWED.length; i++) {
@@ -643,7 +642,7 @@
   }
   function orderTif(o) {
     var t = o && o.tif != null ? String(o.tif) : "Alo";
-    if (/^ioc$/i.test(t)) return "Ioc";
+    if (/^ioc$/i.test(t)) throw new Error("refusing IOC; flatten/exit is maker ALO only");
     return "Alo";
   }
   function buildOrderAction(orders) {
@@ -1493,11 +1492,17 @@
     var a = nowMs() - since;
     return a > 0 ? a : 0;
   }
+  function quoteStaleMs(plan) {
+    return plan && plan.mode === "flat" ? STALE_QUOTE_MS : FLAT_STALE_MS;
+  }
+  function isQuoteStale(coin, plan) {
+    if (!state.quotePlacedAt[coin]) return false;
+    return nowMs() - state.quotePlacedAt[coin] > quoteStaleMs(plan);
+  }
   function flattenStageOf(coin) {
     var szi = posSzi(coin);
     if (!(Math.abs(szi) > 0)) return "flat";
     var age = posAgeMs(coin);
-    if (age >= FLAT_TAKE_MS) return "take";
     if (age >= FLAT_FAR_MS) return "mid";
     return "far";
   }
@@ -1525,10 +1530,6 @@
     if (!(Number.isFinite(mid) && mid > 0) && ba.bid && ba.ask) mid = (Number(ba.bid) + Number(ba.ask)) / 2;
     var tickSrc = Number.isFinite(mid) && mid > 0 ? mid : Number(ba.bid || ba.ask);
     var tick = Number.isFinite(tickSrc) && tickSrc > 0 ? tickSize(tickSrc, szd) : 0;
-    if (stage === "take") {
-      if (!ba.bid || !ba.ask) return null;
-      return { buy: ba.ask, sell: ba.bid };
-    }
     if (stage === "mid") {
       var midPx = Number.isFinite(mid) && mid > 0 ? roundPx(mid, szd) : "";
       var insideBuy = ba.ask && tick ? roundPx(Number(ba.ask) - tick, szd) : "";
@@ -1552,13 +1553,7 @@
     var px = null;
     if (szi > 0 || szi < 0) {
       var raw = flattenPxFor(q, stage);
-      if (stage === "take") {
-        tif = "Ioc";
-        take = true;
-        px = raw;
-      } else {
-        px = raw ? clampMakerPx(q, raw) : null;
-      }
+      px = raw ? clampMakerPx(q, raw) : null;
     } else {
       stage = "flat";
       age = 0;
@@ -1586,14 +1581,12 @@
     var ageS = Math.floor(posAgeMs(coin) / 1000);
     var stage = flattenStageOf(coin);
     if (szi > 0) {
-      if (stage === "take") return name + " 多 " + fmtSzi(szi) + " 超时 → 吃单平仓 @bid";
-      if (stage === "mid") return name + " 多 " + fmtSzi(szi) + " 等平 " + ageS + "s → 挂中间";
-      return name + " 多 " + fmtSzi(szi) + " 等平 " + ageS + "s → 挂卖平 @ask";
+      if (stage === "mid") return name + " 多 " + fmtSzi(szi) + " 等平 " + ageS + "s → 挂中间 ALO";
+      return name + " 多 " + fmtSzi(szi) + " 等平 " + ageS + "s → 挂卖平 @ask ALO";
     }
     if (szi < 0) {
-      if (stage === "take") return name + " 空 " + fmtSzi(Math.abs(szi)) + " 超时 → 吃单平仓 @ask";
-      if (stage === "mid") return name + " 空 " + fmtSzi(Math.abs(szi)) + " 等平 " + ageS + "s → 挂中间";
-      return name + " 空 " + fmtSzi(Math.abs(szi)) + " 等平 " + ageS + "s → 挂买平 @bid";
+      if (stage === "mid") return name + " 空 " + fmtSzi(Math.abs(szi)) + " 等平 " + ageS + "s → 挂中间 ALO";
+      return name + " 空 " + fmtSzi(Math.abs(szi)) + " 等平 " + ageS + "s → 挂买平 @bid ALO";
     }
     return name + " 空仓 双边";
   }
@@ -1749,8 +1742,7 @@
     if (!autoOn(coin)) return;
     try {
       var planW = flattenPlan(coin, q);
-      var staleFlat = planW.mode === "flat" && state.quotePlacedAt[coin] && (nowMs() - state.quotePlacedAt[coin] > STALE_QUOTE_MS);
-      if (planW.take || staleFlat) {
+      if (isQuoteStale(coin, planW)) {
         scheduleRequote(coin, "ws requote");
         return;
       }
@@ -1825,27 +1817,17 @@
   async function placeSides(coin, q, px, wantBuy, wantSell, plan) {
     plan = plan || flattenPlan(coin, q, px);
     if (plan.px) px = plan.px;
-    var take = !!plan.take;
-    var tif = plan.tif || "Alo";
-    if (!take) {
-      var clamped = clampMakerPx(q, px);
-      if (!clamped) {
-        warn("盘口交叉或无法做 maker，跳过挂单", coin);
-        if (coin) {
-          state.lastQuoted[coin] = "";
-          state.needsRequote[coin] = true;
-        }
-        return { skipped: true };
-      }
-      px = clamped;
-    } else if (!px || !px.buy || !px.sell) {
-      warn("吃单平仓无盘口", coin);
+    var tif = "Alo";
+    var clamped = clampMakerPx(q, px);
+    if (!clamped) {
+      warn("盘口交叉或无法做 maker，跳过挂单", coin);
       if (coin) {
         state.lastQuoted[coin] = "";
         state.needsRequote[coin] = true;
       }
-      return { iocFail: true, skipped: true };
+      return { skipped: true };
     }
+    px = clamped;
     var slot = oidSlot(coin);
     var buySz = plan.buySz;
     var sellSz = plan.sellSz;
@@ -1865,10 +1847,6 @@
     if (mods.length) {
       lastResp = await sendSignedAction(buildModifyAction(mods));
       if (aloPxReject(lastResp)) {
-        if (take) {
-          warn("IOC 平仓未成", coin, lastResp && (lastResp.message || lastResp));
-          return { iocFail: true, resp: lastResp };
-        }
         markAloReject(coin, lastResp);
         return { aloReject: true, resp: lastResp };
       }
@@ -1878,7 +1856,6 @@
         var merr = statusError(mst[mi]);
         if (merr || !actionOk(lastResp)) {
           if (aloPxReject(merr) || aloPxReject(lastResp)) {
-            if (take) return { iocFail: true, resp: lastResp };
             markAloReject(coin, merr || lastResp);
             return { aloReject: true, resp: lastResp };
           }
@@ -1907,32 +1884,14 @@
     if (orders.length) {
       lastResp = await sendSignedAction(buildOrderAction(orders));
       if (aloPxReject(lastResp)) {
-        if (take) {
-          warn("IOC 平仓未成", coin, lastResp && (lastResp.message || lastResp));
-          return { iocFail: true, resp: lastResp };
-        }
         markAloReject(coin, lastResp);
         return { aloReject: true, resp: lastResp };
       }
       if (!actionOk(lastResp)) {
-        if (take) {
-          warn("IOC 平仓失败", coin, lastResp && (lastResp.message || lastResp));
-          return { iocFail: true, resp: lastResp };
-        }
         throw new Error("下单失败 " + JSON.stringify(lastResp));
       }
       ingestOrderStatuses(coin, orders, lastResp);
-      if (take) {
-        var stsI = respStatuses(lastResp);
-        var ii;
-        for (ii = 0; ii < stsI.length; ii++) {
-          if (statusError(stsI[ii])) {
-            warn("IOC 平仓状态", coin, statusError(stsI[ii]));
-            return { iocFail: true, resp: lastResp };
-          }
-        }
-      }
-      log((take ? "吃单 " : "挂单 ") + coin + (wantBuy && plan.wantBuy ? " 买 " + buySz + " @ " + px.buy + (plan.buyR ? " ro" : "") : "") + (wantSell && plan.wantSell ? " 卖 " + sellSz + " @ " + px.sell + (plan.sellR ? " ro" : "") : "") + " " + tif);
+      log("挂单 " + coin + (wantBuy && plan.wantBuy ? " 买 " + buySz + " @ " + px.buy + (plan.buyR ? " ro" : "") : "") + (wantSell && plan.wantSell ? " 卖 " + sellSz + " @ " + px.sell + (plan.sellR ? " ro" : "") : "") + " " + tif);
     }
     try { await sweepExtraOids(coin); } catch (eSw) { warn("扫多余", coin, eSw && eSw.message); }
     return lastResp;
@@ -1957,36 +1916,6 @@
       await refreshPositions(forcePos);
       plan = flattenPlan(coin, q);
       var px = plan.px;
-      if (plan.take) {
-        await cancelCoinRests(coin);
-        if (!autoOn(coin)) return;
-        var nowT = nowMs();
-        if (state.lastTakeAt[coin] && nowT - state.lastTakeAt[coin] < POLL_MS) {
-          await maybeDeadMan();
-          return;
-        }
-        state.lastTakeAt[coin] = nowT;
-        if (!px) {
-          warn("吃单平仓无盘口", coin);
-          state.lastQuoted[coin] = "";
-          state.needsRequote[coin] = true;
-          deferRequote = true;
-          return;
-        }
-        var iocPlaced = await placeSides(coin, q, px, plan.wantBuy, plan.wantSell, plan);
-        state.lastQuoted[coin] = "";
-        state.quotePlacedAt[coin] = 0;
-        state.posForce = true;
-        try { await refreshPositions(true); } catch (eP) { warn("吃单后刷新仓位", eP && eP.message); }
-        if (Math.abs(posSzi(coin)) > 0) {
-          state.needsRequote[coin] = true;
-          deferRequote = true;
-        }
-        log("吃单平仓 " + flattenStatusBit(coin) + (iocPlaced && iocPlaced.iocFail ? " 未成将重试" : ""));
-        setStatus("自动紧贴 " + flattenStatusBit(coin), false);
-        await maybeDeadMan();
-        return;
-      }
       if (!px) {
         warn("盘口交叉或无法做 maker，跳过", coin);
         state.lastQuoted[coin] = "";
@@ -2001,7 +1930,7 @@
       var haveSell = slot.sell != null;
       var wantBuy = !!plan.wantBuy;
       var wantSell = !!plan.wantSell;
-      var stale = plan.mode === "flat" && state.quotePlacedAt[coin] && (nowMs() - state.quotePlacedAt[coin] > STALE_QUOTE_MS);
+      var stale = isQuoteStale(coin, plan);
       var sameCoverage = haveBuy === wantBuy && haveSell === wantSell;
       if (sameCoverage && key === state.lastQuoted[coin] && !stale) {
         if (extras.length) {
@@ -2010,7 +1939,7 @@
         await maybeDeadMan();
         return;
       }
-      if (stale) log("空仓报价过旧，撤后重挂", coin);
+      if (stale) log(plan.mode === "flat" ? "空仓报价过旧，撤后重挂" : "平仓 ALO 过旧，撤后重挂", coin);
       else if (key !== state.lastQuoted[coin] || !sameCoverage) log("计划变更，先撤再挂", coin, plan.stage, plan.tif);
       await cancelCoinRests(coin);
       if (!autoOn(coin)) return;
@@ -2022,18 +1951,11 @@
         }
       }
       state.lastQuoted[coin] = key;
-      if (plan.mode === "flat") state.quotePlacedAt[coin] = nowMs();
-      else state.quotePlacedAt[coin] = 0;
+      state.quotePlacedAt[coin] = nowMs();
       log("改价 " + coin + " " + flattenStatusBit(coin) + " 买@" + px.buy + " 卖@" + px.sell);
       setStatus("自动紧贴 " + flattenStatusBit(coin), false);
       await maybeDeadMan();
     } catch (eReq) {
-      if (plan && plan.take) {
-        warn("IOC 平仓重试", coin, eReq && eReq.message);
-        state.lastQuoted[coin] = "";
-        deferRequote = true;
-        return;
-      }
       if (aloPxReject(eReq)) {
         markAloReject(coin, eReq);
         deferRequote = true;
@@ -2376,8 +2298,7 @@
           try {
             var qn = state.quotes[coin];
             var pln = flattenPlan(coin, qn);
-            if (pln.take) need = true;
-            else if (pln.mode === "flat" && state.quotePlacedAt[coin] && nowMs() - state.quotePlacedAt[coin] > STALE_QUOTE_MS) need = true;
+            if (isQuoteStale(coin, pln)) need = true;
             else if (!pln.px) need = state.lastQuoted[coin] !== "";
             else if (quoteKey(pln.px, pln) !== state.lastQuoted[coin]) need = true;
           } catch (ePx0) { need = !wsFresh; }
@@ -2443,24 +2364,13 @@
       var plan = flattenPlan(coin, q);
       var px = plan.px;
       if (!px) {
-        warn(plan.take ? "吃单平仓无盘口" : "盘口交叉或无法做 maker，跳过", coin);
-        setStatus(plan.take ? "吃单平仓无盘口，稍后重试" : "盘口交叉，稍后重挂", false);
+        warn("盘口交叉或无法做 maker，跳过", coin);
+        setStatus("盘口交叉，稍后重挂", false);
         return;
       }
       var buySz = plan.buySz;
       var sellSz = plan.sellSz;
       var resp;
-      if (plan.take) {
-        await cancelAllForCoin(coin, wallet, { refetch: false });
-        resp = await placeSides(coin, q, px, plan.wantBuy, plan.wantSell, plan);
-        if (resp && (resp.iocFail || resp.aloReject || resp.skipped)) {
-          setStatus("自动紧贴 " + flattenStatusBit(coin), false);
-          return resp;
-        }
-        state.lastQuoted[coin] = "";
-        setStatus("实盘 " + flattenStatusBit(coin) + " " + JSON.stringify(resp && resp.response ? resp.response : resp), false);
-        return resp;
-      }
       var slot = oidSlot(coin);
       var extras = state.extraOids[coin] || [];
       if (extras.length) {
@@ -2575,7 +2485,7 @@
       await refreshPositions(true);
       var plan = flattenPlan(coin, q);
       var px = plan.px;
-      if (!px) throw new Error(plan.take ? "吃单平仓无盘口" : "盘口交叉，无法做 maker");
+      if (!px) throw new Error("盘口交叉，无法做 maker");
       if (isBuy && !plan.wantBuy) throw new Error(coin + " 已有多仓，只允许 reduce-only 卖平");
       if (!isBuy && !plan.wantSell) throw new Error(coin + " 已有空仓，只允许 reduce-only 买平");
       await cancelAllForCoin(coin, wallet, { refetch: false });
@@ -2586,18 +2496,10 @@
       log("实盘签名", coin, isBuy ? "买" : "卖", sz, "@", p, rOnly ? "ro" : "", plan.tif || "Alo", "asset", q.assetId);
       var resp = await sendSignedAction(action);
       if (aloPxReject(resp)) {
-        if (plan.take) {
-          warn("IOC 平仓未成", coin, resp && (resp.message || resp));
-          return resp;
-        }
         markAloReject(coin, resp);
         return;
       }
       if (!actionOk(resp)) {
-        if (plan.take) {
-          warn("IOC 平仓失败", coin, resp && (resp.message || resp));
-          return resp;
-        }
         throw new Error("下单失败 " + JSON.stringify(resp));
       }
       ingestOrderStatuses(coin, [{ a: q.assetId, b: !!isBuy, p: p, s: sz, r: rOnly }], resp);
@@ -2798,7 +2700,7 @@
   function buildPanelOnce(box) {
     if (box.getAttribute("data-ed-built") === "1") return;
     box.setAttribute("data-ed-built", "1");
-    box.appendChild(el("div", { class: "ed-top" }, [el("div", { class: "ed-title", text: "Entropy Desk · ANTH / SNDK  1.6.1" }), el("span", { class: "ed-muted", id: "ed-wallet", text: shortAddr(currentWallet()) })]));
+    box.appendChild(el("div", { class: "ed-top" }, [el("div", { class: "ed-title", text: "Entropy Desk · ANTH / SNDK  1.6.2" }), el("span", { class: "ed-muted", id: "ed-wallet", text: shortAddr(currentWallet()) })]));
     box.appendChild(el("div", { class: "ed-fees", text: "净手续费  taker ≈ 0   maker 0\nHL档4 0.028% × HIP-3×2 × growth×0.1 − Entropy自返200%×50%份额" }));
     var inp = el("input", { type: "number", min: "10", step: "1", value: String(state.notional), id: "ed-notional" });
     inp.addEventListener("change", function () { var v = Number(inp.value); if (v > 0) state.notional = v; });
@@ -2816,7 +2718,7 @@
     autoLab.appendChild(autoCk);
     autoLab.appendChild(document.createTextNode(" 全部自动紧贴"));
     box.appendChild(el("div", { class: "ed-row" }, [autoLab]));
-    box.appendChild(el("div", { class: "ed-muted", id: "ed-automm-help", text: "空仓双边，价差>2tick 往中间贴；有仓 reduce-only：<6s 远档 ALO，6–15s 中间，≥15s IOC 吃单平仓" }));
+    box.appendChild(el("div", { class: "ed-muted", id: "ed-automm-help", text: "空仓双边，价差>2tick 往中间贴；有仓 reduce-only：<6s 远档 ALO，≥6s 中间 ALO，超时撤换 ALO（不 IOC）" }));
     box.appendChild(el("div", { class: "ed-muted", id: "ed-deadman-note", text: "定时撤是账户级，会动到其它市场手单" }));
     box.appendChild(el("div", { class: "ed-muted", id: "ed-mode", text: "自动紧贴：空仓双边，有仓只挂平仓侧" }));
     ALLOWED.forEach(function (c) { box.appendChild(buildCoinCard(c)); });
@@ -2866,9 +2768,9 @@
       render();
     } finally { state.polling = false; }
   }
-  window.EntropyDesk = { version: "1.6.1", state: state, fee: FEE, refresh: tick, paperBoth: paperBoth, liveBoth: liveBoth, liveOrder: liveOrder, approveBuilder: approveBuilder, openTrade: openTrade, assertAllowedCoin: assertAllowedCoin, printFees: printFees, setAutoMm: setAutoMm, setAutoCoin: setAutoCoin, cancelCoinOrders: cancelCoinOrders, cancelAllDesk: cancelAllDesk, aloPrices: aloPrices, clampMakerPx: clampMakerPx, aloPxReject: aloPxReject };
+  window.EntropyDesk = { version: "1.6.2", state: state, fee: FEE, refresh: tick, paperBoth: paperBoth, liveBoth: liveBoth, liveOrder: liveOrder, approveBuilder: approveBuilder, openTrade: openTrade, assertAllowedCoin: assertAllowedCoin, printFees: printFees, setAutoMm: setAutoMm, setAutoCoin: setAutoCoin, cancelCoinOrders: cancelCoinOrders, cancelAllDesk: cancelAllDesk, aloPrices: aloPrices, clampMakerPx: clampMakerPx, aloPxReject: aloPxReject };
   printFees();
-  log("已加载 1.6.1。每币最多 1 买 + 1 卖。阶段/tif/价变先撤再挂。空仓双边 ALO：价差≤2tick 贴买卖一，价差>2tick 往中间贴。有仓 reduce-only：<6s 远档 ALO，6–15s 中间 ALO，≥15s 撤后 IOC 吃单平仓。空仓同价挂 45s 无成交则重挂。ALO 价被拒则跟新盘口重挂。IOC 失败不停止。dead-man 20s 账户级，停止时清除。");
+  log("已加载 1.6.2。每币最多 1 买 + 1 卖。阶段/tif/价变先撤再挂。空仓双边 ALO：价差≤2tick 贴买卖一，价差>2tick 往中间贴。有仓 reduce-only：<6s 远档 ALO，≥6s 中间 ALO，超时撤换 ALO（90s），不 IOC 吃单。空仓同价挂 45s 无成交则重挂。ALO 价被拒则跟新盘口重挂。dead-man 20s 账户级，停止时清除。");
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", function () { render(); tick(); });
   else { render(); tick(); }
   setInterval(tick, POLL_MS);
